@@ -87,7 +87,7 @@ stmt_opcodes = {
     IMPORT_NAME, IMPORT_FROM,
     RETURN_VALUE, YIELD_VALUE,
     RAISE_VARARGS,
-    POP_TOP,
+    STORE_SUBSCR, DELETE_SUBSCR,
 }
 
 # Conditional branching opcode that make up if statements and and/or
@@ -302,6 +302,16 @@ def code_walker(code):
         yield i, (op, oparg)
         i += offset
 
+def SPyNot(o):
+    if isinstance(o, PyNot):
+        return o.operand
+    elif isinstance(o, PyBooleanAnd):
+        if o.allowCollision:
+            return PyBooleanOr(SPyNot(o.left), SPyNot(o.right), True)
+    elif isinstance(o, PyBooleanOr):
+        if o.allowCollision:
+            return PyBooleanAnd(SPyNot(o.left), SPyNot(o.right), True)
+    return PyNot(o)
 
 class CodeFlags(object):
     def __init__(self, cf):
@@ -361,17 +371,42 @@ class Code:
         self.name = code_obj.co_name
         self.globals = []
         self.nonlocals = []
-        self.jump_targets = []
+        self.loops = []
+        self.annotationd = False
+        self.linemap = []
+        self.lineno = []
+        self.start_chained_jumps = []
+        self.inner_chained_jumps = []
+        self.end_chained_jumps = []
+        self.statement_jumps = []
+        self.ternaryop_jumps = []
         self.find_else()
+        
+        curinstr = 0
+        l = len(code_obj.co_lnotab)
+        curlineno = code_obj.co_firstlineno
+        if l > 0 and code_obj.co_lnotab[0] == 0:
+            curlineno = curlineno + code_obj.co_lnotab[1]
+            i = 2
+        else:
+            i = 0
+        self.linemap.append(curinstr)
+        self.lineno.append(curlineno)
+        while i < l:
+            curinstr = curinstr + code_obj.co_lnotab[i]
+            curlineno = curlineno + code_obj.co_lnotab[i +1]
+            if code_obj.co_lnotab[i] != 127 and code_obj.co_lnotab[i +1] != 127:
+                self.linemap.append(curinstr)
+                self.lineno.append(curlineno)
+            i = i + 2
+        self.linemap = tuple(self.linemap)
+        self.lineno = tuple(self.lineno)
         self.find_jumps()
-        trace('================================================')
-        trace(self.code_obj)
-        trace('================================================')
-        for addr in self:
-            trace(str(addr))
-            if addr.opcode in stmt_opcodes or addr.opcode in pop_jump_if_opcodes:
-                trace(' ')
-        trace('================================================')
+        self.start_chained_jumps = tuple(self.start_chained_jumps)
+        self.inner_chained_jumps = tuple(self.inner_chained_jumps)
+        self.end_chained_jumps = tuple(self.end_chained_jumps)
+        self.statement_jumps = tuple(self.statement_jumps)
+        self.ternaryop_jumps = tuple(self.ternaryop_jumps)
         self.flags: CodeFlags = CodeFlags(code_obj.co_flags)
 
     def __getitem__(self, instr_index):
@@ -393,11 +428,199 @@ class Code:
         return i < len(self.code_obj.co_cellvars)
 
     def find_jumps(self):
-        for addr in self:
+        def proc_chained(self, addr: Address) -> Address:
+            if addr[-3] and \
+                    addr[-1].opcode == COMPARE_OP and \
+                    addr[-2].opcode == ROT_THREE and \
+                    addr[-3].opcode == DUP_TOP:
+                self.start_chained_jumps.append(addr)
+                jump_addr = addr.jump()
+                curaddr = addr[1]
+                while True:
+                    if curaddr.opcode in pop_jump_if_opcodes:
+                        if curaddr[-3].opcode == DUP_TOP and curaddr[-2].opcode == ROT_THREE:
+                            if curaddr.arg == addr.arg:
+                                self.inner_chained_jumps.append(curaddr)
+                                addr = curaddr
+                        elif curaddr[2] == addr.jump():
+                            self.end_chained_jumps.append(curaddr)
+                            return curaddr
+                        else:
+                            curaddr = proc_chained(self, curaddr)
+                            if curaddr.jump()[-1].opcode == JUMP_FORWARD:# (a if b else c)
+                                self.ternaryop_jumps.append(curaddr)
+                    curaddr = curaddr[1]
+            return addr
+        def pj_start_true(addr: Address)-> Address:
+            next_addr = addr[1]
+            if next_addr.opcode == JUMP_FORWARD and next_addr.arg == 0:# if (a if b else True):
+                addr = next_addr
+                next_addr = next_addr[1]
+            if addr[4] and addr[2].opcode == POP_TOP and\
+                    (next_addr.opcode == JUMP_ABSOLUTE or next_addr.opcode == JUMP_FORWARD):
+                    #addr in self.end_chained_jumps:
+                if addr.opcode == POP_JUMP_IF_FALSE:# (a<b<c)
+                    assert (addr[3].opcode == JUMP_ABSOLUTE or addr[3].opcode == JUMP_FORWARD)
+                    return addr[4]
+                else:# not(a<b<c)
+                    return addr[3]
+            return next_addr
+        i = 0
+        while i < len(self.instr_seq):
+            addr = Address(self, i)
             opcode, arg = addr
             jt = addr.jump()
             if jt:
-                self.jump_targets.append(jt)
+                if opcode == SETUP_LOOP:
+                    end_addr = jt[-1]
+                    isforloop = False
+                    
+                    #   detect:
+                    #if ...:
+                    #   ...
+                    #   while ...:
+                    #       ...
+                    #else:
+                    curaddr = Address(self, 0)
+                    while curaddr < addr:
+                        if curaddr.opcode in pop_jump_if_opcodes:
+                            if addr.addr < curaddr.arg < end_addr.addr:
+                                curaddr = curaddr.jump()
+                                jt = curaddr[-1]
+                                end_addr = jt[-1]
+                                break
+                        curaddr = curaddr[1]
+                    
+                    curaddr = addr[1]
+                    while True:
+                        if curaddr >= end_addr or curaddr.opcode in stmt_opcodes:
+                            break
+                        if curaddr.opcode in for_jump_opcodes:
+                            isforloop = True
+                            break
+                        elif curaddr.opcode in else_jump_opcodes:
+                            cur_addr = curaddr.jump()
+                            if cur_addr and cur_addr.opcode in for_jump_opcodes:
+                                isforloop = True
+                            break
+                        curaddr = curaddr[1]
+                    end_cond = 0
+                    if isforloop:
+                        end_cond = -1
+                    else:
+                        curaddr = addr[1]
+                        while curaddr < end_addr:
+                            if curaddr.opcode in stmt_opcodes:
+                                break
+                            if curaddr.opcode in pop_jump_if_opcodes:
+                                if curaddr.jump().opcode == POP_BLOCK or curaddr.jump() == end_addr:
+                                    end_cond = curaddr.index
+                            curaddr = curaddr[1]
+                        if end_cond > 0:
+                            i = end_cond
+                            dto = Address(self, end_cond)
+                            self.statement_jumps.append(dto)
+                            curaddr = addr[1]
+                            while curaddr < dto:
+                                if curaddr.opcode in pop_jump_if_opcodes:
+                                    curaddr = proc_chained(self, curaddr)
+                                    curjump = curaddr.jump()
+                                    if curjump[-1].opcode == JUMP_FORWARD:# (a if b else c)
+                                        x = curaddr[1]
+                                        while x < curjump:
+                                            if x.opcode in pop_jump_if_opcodes and\
+                                                    x.arg == curaddr.arg:# aa or (a if b else True)
+                                                x = None
+                                                break
+                                            x = x[1]
+                                        if x:
+                                            self.ternaryop_jumps.append(curaddr)
+                                curaddr = curaddr[1]
+                    if end_addr.opcode == POP_BLOCK:
+                        jt = end_addr
+                    self.loops.append((addr.index, end_cond, jt.index))
+                elif opcode in pop_jump_if_opcodes:
+                    next_stmt = addr.seek_stmt(None)
+                    #find start true
+                    curaddr = addr
+                    lastjump = None
+                    while curaddr < next_stmt:
+                        if curaddr.opcode in pop_jump_if_opcodes:
+                            if curaddr.arg > next_stmt.addr or curaddr.arg < addr.addr or\
+                                    (curaddr[2] == curaddr.jump() and curaddr[1].opcode == JUMP_FORWARD and curaddr[1].jump() > next_stmt):#  <--   if a: pass else:
+                                if lastjump is None or lastjump.arg == curaddr.arg:
+                                    lastjump = curaddr
+                                else:
+                                    break
+                        curaddr = curaddr[1]
+                    if self.name in ('<lambda>','<listcomp>','<setcomp>','<dictcomp>','<genexpr>'):
+                        self.statement_jumps.append(lastjump)
+                        lastjump = None
+                    if lastjump:
+                        start_true = pj_start_true(lastjump)
+                        curjump = addr
+                        dto = addr
+                        while curjump < start_true:
+                            curjump = proc_chained(self, curjump)
+                            x = curjump.jump()[-1]
+                            if curjump.addr < curjump.arg <= next_stmt.addr and\
+                                    x.opcode == JUMP_FORWARD:# (a if b else c)
+                                curaddr = curjump[1]
+                                while curaddr < x:
+                                    if curaddr.opcode in pop_jump_if_opcodes and\
+                                            curaddr.arg == curjump.arg:# aa or (a if b else True)
+                                        curaddr = None
+                                        break
+                                    curaddr = curaddr[1]
+                                if curaddr:
+                                    if x.jump() > next_stmt:#  if a: pass else:
+                                        self.statement_jumps.append(curjump)
+                                    else:
+                                        self.ternaryop_jumps.append(curjump)
+                                        if x > dto:
+                                            dto = x.jump()[-2]#-2 in case if (a if b else True):
+                            elif curjump.arg == start_true.addr:# if a or
+                                dto = lastjump
+                            elif curjump.addr < curjump.arg < start_true.addr:
+                                if x > dto:
+                                    dto = x
+                            else:
+                                if dto <= curjump:
+                                    if pj_start_true(curjump).addr in self.linemap:
+                                        if curjump not in self.statement_jumps:
+                                            self.statement_jumps.append(curjump)# just if a:
+                                    elif curjump == lastjump:
+                                        if next_stmt.opcode == RETURN_VALUE:
+                                            self.ternaryop_jumps.append(curjump)# return (a if b else c)
+                            curjump = curjump[1]
+                            while curjump < start_true:
+                                if curjump.opcode in pop_jump_if_opcodes:
+                                    break
+                                curjump = curjump[1]
+                        i = start_true.index - 1
+                    else:
+                        curjump = addr
+                        while curjump < next_stmt:
+                            curjump = proc_chained(self, curjump)
+                            if curjump.addr < curjump.arg <= next_stmt.addr:
+                                x = curjump.jump()[-1]
+                                if x.opcode == JUMP_FORWARD:# (a if b else c)
+                                    curaddr = curjump[1]
+                                    while curaddr < x:
+                                        if curaddr.opcode in pop_jump_if_opcodes and\
+                                                curaddr.arg == curjump.arg:# aa or (a if b else True)
+                                            curaddr = None
+                                            break
+                                        curaddr = curaddr[1]
+                                    if curaddr:
+                                        self.ternaryop_jumps.append(curjump)
+                            curjump = curjump[1]
+                            while curjump < next_stmt:
+                                if curjump.opcode in pop_jump_if_opcodes:
+                                    break
+                                curjump = curjump[1]
+                        i = next_stmt.index - 1
+            i = i + 1
 
     def find_else(self):
         jumps = {}
@@ -432,6 +655,18 @@ class Code:
 
     def get_suite(self, include_declarations=True, look_for_docstring=False) -> Suite:
         dec = SuiteDecompiler(self[0])
+        trace('\nname = '+self.name+'\n')
+        for g in self.instr_seq:
+            aop,aarg = g[1]
+            if g[0] in self.linemap:
+                trace('\n'+str(self.lineno[self.linemap.index(g[0])])+': ')
+            trace(' ('+str(g[0])+': '+opname[aop]+'('+str(aarg)+'), ')
+        trace('\nstatement_jumps:\n')
+        for ttt in self.statement_jumps:
+            trace(str(ttt)+'\n')
+        trace('\nternaryop_jumps:\n')
+        for ttt in self.ternaryop_jumps:
+            trace(str(ttt)+'\n')
         dec.run()
         first_stmt = dec.suite and dec.suite[0]
         # Change __doc__ = "docstring" to "docstring"
@@ -467,11 +702,12 @@ class Code:
         name in one of the surrounding code objects.  This is called
         by LOAD_GLOBAL
         """
-        parent = self.parent
-        while parent:
-            if name in parent.varnames:
-                return self.declare_global(name)
-            parent = parent.parent
+        if not self.name in ('<lambda>','<listcomp>','<setcomp>','<dictcomp>','<genexpr>'):
+            parent = self.parent
+            while parent:
+                if name in parent.varnames or name in parent.globals:
+                    return self.declare_global(name)
+                parent = parent.parent
 
     def declare_nonlocal(self, name):
         """
@@ -507,7 +743,7 @@ class Address:
     def __str__(self):
         mark = "* " if self in self.code.else_jumps else "  "
         jump = self.jump()
-        jt = '>>' if self.is_jump_target else '  '
+        jt = '  '
         arg = self.arg or "  "
         jdest = '\t(to {})'.format(jump.addr) if jump and jump.addr != self.arg else ''
         val = ''
@@ -555,9 +791,24 @@ class Address:
         return self in self.code.else_jumps
 
     @property
-    def is_jump_target(self):
-        return self in self.code.jump_targets
-
+    def is_continue_jump(self):
+        if self.opcode in (POP_JUMP_IF_TRUE, POP_JUMP_IF_FALSE, JUMP_ABSOLUTE):
+            jump_addr = self.jump()
+            if jump_addr.opcode == FOR_ITER or jump_addr[-1].opcode == SETUP_LOOP:
+                return True
+        return False
+    
+    @property
+    def is_statement(self):
+        if self.opcode in stmt_opcodes or\
+                self.opcode == JUMP_ABSOLUTE and self.addr in self.code.linemap:
+            return True
+        if self.opcode == POP_TOP:
+            if self[-1] and self[-1].opcode in (JUMP_ABSOLUTE, JUMP_FORWARD, ROT_TWO):
+                return False
+            return True
+        return False
+    
     def change_instr(self, opcode, arg=None):
         self.code.instr_seq[self.index] = (self.addr, (opcode, arg))
 
@@ -569,6 +820,8 @@ class Address:
             return self.code.address(self.arg)
 
     def seek(self, opcode: Iterable, increment: int, end: Address = None) -> Address:
+        if self == end:
+            return None
         if not isinstance(opcode, Iterable):
             opcode = (opcode,)
         a = self[increment]
@@ -582,15 +835,22 @@ class Address:
 
     def seek_forward(self, opcode: Union[Iterable, int], end: Address = None) -> Address:
         return self.seek(opcode, 1, end)
+    
+    def seek_stmt(self, end: Address) ->Address:
+        a = self
+        while a and (end is None or a < end):
+            if a.is_statement:
+                return a
+            a = a[1]
+        return None
 
-
-    def seek_back_statement(self, opcode: Union[Iterable, int]) -> Address:
-        last_statement = self.seek_back(stmt_opcodes)
-        return self.seek(opcode, -1, last_statement)
-
-    def seek_forward_statement(self, opcode: Union[Iterable, int]) -> Address:
-        next_statement = self.seek_forward(stmt_opcodes)
-        return self.seek(opcode, 1, next_statement)
+    def last_loop_context(self):
+        lcontext = (-1,-1,-1)
+        for lcontexti in self.code.loops:
+            if lcontexti[0] <= self.index <= lcontexti[2]:
+                if lcontext[0] < lcontexti[0]:
+                    lcontext = lcontexti
+        return lcontext
 
 
 class AsyncMixin:
@@ -862,11 +1122,35 @@ class PyBooleanAnd(PyBinaryOp):
     precedence = 4
     pattern = "{} and {}"
 
+    def __init__(self, left, right, allowCollision = None):
+        super().__init__(left, right)
+        if allowCollision is None:
+            self.allowCollision = False
+            if isinstance(left, PyNot):
+                if not(isinstance(right, PyCompare) and right.complist[1].startswith('is')):
+                    self.allowCollision = True
+            elif isinstance(right, PyNot):
+                if not(isinstance(left, PyCompare) and left.complist[1].startswith('is')):
+                    self.allowCollision = True
+        else:
+            self.allowCollision = allowCollision
 
 class PyBooleanOr(PyBinaryOp):
     precedence = 3
     pattern = "{} or {}"
 
+    def __init__(self, left, right, allowCollision = None):
+        super().__init__(left, right)
+        if allowCollision is None:
+            self.allowCollision = False
+            if isinstance(left, PyNot):
+                if not(isinstance(right, PyCompare) and right.complist[1].startswith('is')):
+                    self.allowCollision = True
+            elif isinstance(right, PyNot):
+                if not(isinstance(left, PyCompare) and left.complist[1].startswith('is')):
+                    self.allowCollision = True
+        else:
+            self.allowCollision = allowCollision
 
 class PyIfElse(PyExpr):
     precedence = 2
@@ -1081,7 +1365,7 @@ class PyYield(PyExpr):
         self.value = value
 
     def __str__(self):
-        return "yield {}".format(self.value)
+        return "(yield {})".format(self.value)
 
 
 class PyYieldFrom(PyExpr):
@@ -1091,7 +1375,7 @@ class PyYieldFrom(PyExpr):
         self.value = value
 
     def __str__(self):
-        return "yield from {}".format(self.value)
+        return "(yield from {})".format(self.value)
 
 
 class PyStarred(PyExpr):
@@ -1308,8 +1592,25 @@ class IfStatement(PyStatement):
         self.false_suite.display(indent + 1)
 
     def gen_display(self, seq=()):
-        assert not self.false_suite
-        s = "if {}".format(self.cond)
+        s = 'if '
+        if len(seq) >= 1:
+            ss = seq[-1]
+            if ss[-3:] == ' or' or ss[-4:] == ' and':
+                s = ''
+        if self.false_suite:
+            # missed verifying SimpleStatement 
+            if isinstance(self.true_suite.statements[0], IfStatement):
+                s = s + "not {} or".format(self.cond)
+                return self.true_suite.gen_display(seq + (s,))
+            elif isinstance(self.false_suite.statements[0], IfStatement):
+                s = s + "{} or".format(self.cond)
+                return self.false_suite.gen_display(seq + (s,))
+            else:
+                raise Exception('unrecognized genexp')
+        
+        s = s + "{}".format(self.cond)
+        if isinstance(self.true_suite.statements[0], IfStatement):
+            s = s + ' and'
         return self.true_suite.gen_display(seq + (s,))
 
 
@@ -1476,6 +1777,7 @@ class ClassStatement(DecorableStatement):
         self.func = func
         self.parents = parents
         self.kwargs = kwargs
+        self.name = name
 
     def store(self, dec, dest):
         self.name = dest
@@ -1561,86 +1863,124 @@ class SuiteDecompiler:
         self.suite: Suite = Suite()
         self.assignment_chain = []
         self.popjump_stack = []
-        self.last_addr: Address = None
+        self.scan_for_else = False
+        self.find_end_finally = False
+        if self.end_addr:
+            self.end_block = self.end_addr[-1]
+        else:
+            self.end_block = Address(self.code, len(self.code.instr_seq)-1)
 
     def push_popjump(self, jtruthiness, jaddr, jcond, original_jaddr: Address):
         stack = self.popjump_stack
-        if jaddr and jaddr[-1].is_else_jump:
-            if jtruthiness or jaddr[-1].jump() <= original_jaddr.jump():
-                # Increase jaddr to the 'else' address if it jumps to the 'then'
-                jaddr = jaddr[-1].jump()
+        if original_jaddr in self.code.end_chained_jumps:
+            next_addr = original_jaddr[4]
+        else:
+            next_addr = original_jaddr[1]
         while stack:
             truthiness, addr, cond, original_addr = stack[-1]
-            # if jaddr == None:
-            #     raise Exception("#ERROR: jaddr is None")
-            # jaddr == None
-            if jaddr:
-                if jaddr < addr:
-                    break
-                if jaddr == addr and (truthiness or jtruthiness):
-                    break
-                # if jaddr == addr and not (truthiness or jtruthiness):
-                #     break
-            stack.pop()
-            obj_maker = PyBooleanOr if truthiness else PyBooleanAnd
-            if truthiness and jtruthiness:
-                if original_jaddr.arg == original_addr.arg:
-                    if original_jaddr[2]  and original_jaddr[2].opcode == RAISE_VARARGS:
+            allowCollision = False
+            if jaddr == addr:
+                stack.pop()
+                if truthiness and jtruthiness:
+                    obj_maker = PyBooleanOr
+                elif truthiness and not jtruthiness:
+                    if isinstance(cond, PyCompare) and cond.complist[1].startswith('is'):
                         obj_maker = PyBooleanOr
-                        cond = cond
-                        jcond = jcond
+                        jcond = SPyNot(jcond)
+                        jtruthiness = True
                     else:
                         obj_maker = PyBooleanAnd
-                        cond = PyNot(cond)
-                        jcond = PyNot(jcond)
-                elif original_jaddr.arg > original_addr.arg:
-                    obj_maker = PyBooleanOr
-                    jcond = PyNot(jcond)
-            if not truthiness and not jtruthiness:
-                if original_jaddr.arg < original_addr.arg:
-                    obj_maker = PyBooleanOr
-                    cond = PyNot(cond)
-                elif original_jaddr.arg > original_addr.arg:
-                    obj_maker = PyBooleanOr
-                    cond = PyNot(cond)
-            if truthiness and not jtruthiness:
-                if original_jaddr.arg == original_addr.arg:
+                        cond = SPyNot(cond)
+                        allowCollision = True
+                elif not truthiness and jtruthiness:
+                    if isinstance(jcond, PyCompare) and jcond.complist[1].startswith('is'):
+                        obj_maker = PyBooleanOr
+                        cond = SPyNot(cond)
+                    else:
+                        obj_maker = PyBooleanAnd
+                        jcond = SPyNot(jcond)
+                        jtruthiness = False
+                        allowCollision = True
+                else:
                     obj_maker = PyBooleanAnd
-                    if original_jaddr.opcode != original_addr.opcode:
-                        cond = PyNot(cond)
-            if not truthiness and  jtruthiness:
-                if original_jaddr.arg == original_addr.arg:
-                    jcond = PyNot(jcond)
-                    # cond = PyNot(cond)
-            last_true = original_addr.seek_back(POP_JUMP_IF_TRUE)
-            if isinstance(cond, PyBooleanOr)and obj_maker == PyBooleanAnd and (not last_true or last_true.jump() > original_jaddr):
-                jcond = PyBooleanOr(cond.left, obj_maker(cond.right, jcond))
-            elif isinstance(jcond, obj_maker):
+            elif addr == next_addr:
+                stack.pop()
+                if truthiness and jtruthiness:
+                    if (isinstance(jcond, PyCompare) and jcond.complist[1].startswith('is')) or\
+                            original_jaddr.opcode == JUMP_IF_TRUE_OR_POP:
+                        obj_maker = PyBooleanAnd
+                        cond = SPyNot(cond)
+                    else:
+                        obj_maker = PyBooleanOr
+                        jcond = SPyNot(jcond)
+                        jtruthiness = False
+                        allowCollision = True
+                elif truthiness and not jtruthiness:
+                    obj_maker = PyBooleanOr
+                elif not truthiness and jtruthiness:
+                    obj_maker = PyBooleanAnd
+                else:
+                    if isinstance(cond, PyCompare) and cond.complist[1].startswith('is'):
+                        obj_maker = PyBooleanAnd
+                        jcond = SPyNot(jcond)
+                        jtruthiness = True
+                    else:
+                        obj_maker = PyBooleanOr
+                        cond = SPyNot(cond)
+                        allowCollision = True
+            else:
+                break
+            
+            #last_true = original_addr.seek_back(POP_JUMP_IF_TRUE)
+            #if isinstance(cond, PyBooleanOr)and obj_maker == PyBooleanAnd and (not last_true or last_true.jump() > original_jaddr):
+                #jcond = PyBooleanOr(cond.left, obj_maker(cond.right, jcond))
+            if isinstance(jcond, obj_maker):
                 # Use associativity of 'and' and 'or' to minimise the
                 # number of parentheses
-                jcond = obj_maker(obj_maker(cond, jcond.left), jcond.right)
+                jcond = obj_maker(obj_maker(cond, jcond.left, allowCollision), jcond.right, allowCollision)
             else:
-                jcond = obj_maker(cond, jcond)
+                jcond = obj_maker(cond, jcond, allowCollision)
+        if original_jaddr.opcode == JUMP_IF_TRUE_OR_POP:
+            jtruthiness = not jtruthiness
         stack.append((jtruthiness, jaddr, jcond, original_jaddr))
 
     def pop_popjump(self):
         if not self.popjump_stack:
             raise Exception('Attempted to pop an empty popjump stack.')
         truthiness, addr, cond, original_addr = self.popjump_stack.pop()
+        if truthiness:
+            cond = SPyNot(cond)
         return cond
 
+    def pop_condition_popjump(self):
+        if self.popjump_stack:
+            truthiness, addr, cond, original_addr = self.popjump_stack[-1]
+            if isinstance(cond, PyCompare):
+                truthiness, addr, cond, original_addr = self.popjump_stack.pop()
+                return cond
+        return None
+    
     def run(self):
-        addr, end_addr = self.start_addr, self.end_addr
-        while addr and addr < end_addr:
+        addr = self.start_addr
+        while addr and addr < self.end_addr:
             opcode, arg = addr
             args = (addr,) if opcode < HAVE_ARGUMENT else (addr, arg)
+            if self.scan_for_else:
+                if addr.opcode == JUMP_ABSOLUTE and not addr.addr in self.code.linemap:
+                    break
+                elif addr.opcode == JUMP_FORWARD:
+                    break
+            elif self.find_end_finally and addr.opcode == END_FINALLY:
+                break
             method = getattr(self, opname[opcode])
-            self.last_addr = addr
             new_addr = method(*args)
             if new_addr is self.END_NOW:
+                addr = self.end_addr
                 break
             elif new_addr is None:
                 new_addr = addr[1]
+            if (self.scan_for_else or self.find_end_finally) and addr.opcode == RETURN_VALUE:
+                break
             addr = new_addr
         return addr
 
@@ -1708,23 +2048,31 @@ class SuiteDecompiler:
                 break
             i = i - 1
         return end
-
+    
+    def instructions_after(self, addr):
+        if addr:
+            addr = addr[1]
+            return addr and addr.seek_stmt(None)
+        return False
+    
     #
     # All opcode methods in CAPS below.
     #
 
     def SETUP_LOOP(self, addr: Address, delta):
-        jump_addr = addr.jump()
-        end_addr = jump_addr[-1]
-        if self.is_for_loop(addr[1], end_addr):
-            return
 
-        end_cond = addr.seek_forward(pop_jump_if_opcodes)
-        while end_cond and (end_cond.jump() != end_addr and end_cond.jump().opcode != POP_BLOCK):
-            end_cond = end_cond.seek_forward(pop_jump_if_opcodes)
-        if end_cond:
+        for wcontext in self.code.loops:
+            if wcontext[0] == addr.index:
+                break
+        if wcontext[1] < 0:#is_for_loop
+            return
+        jump_addr = self.code[wcontext[2]] #addr.jump()
+        end_addr = jump_addr[-1]
+        if wcontext[1] > 0:
+            end_cond = self.code[wcontext[1]]
             end_cond_j = end_cond.jump()
             d_body = SuiteDecompiler(addr[1], end_cond.jump())
+            d_body.end_while_condition = end_cond
             d_body.run()
             result = d_body.suite.statements.pop()
             if isinstance(result, IfStatement):
@@ -1734,19 +2082,23 @@ class SuiteDecompiler:
                     d_else.run()
                     while_stmt.else_body = d_else.suite
                 self.suite.add_statement(while_stmt)
-            elif isinstance(result, WhileStatement):
-                self.suite.add_statement(result)
-            return jump_addr
+            else:
+                self.suite.add_statement(SimpleStatement('"""unpyc3: decompilation error: while condition isnt IfStatement"""'))
+                while_stmt = WhileStatement(PyName('unrecognised'), d_body.suite)
+                if(end_cond_j.opcode == POP_BLOCK):
+                    d_else = SuiteDecompiler(end_cond_j[1],jump_addr)
+                    d_else.run()
+                    while_stmt.else_body = d_else.suite
+                self.suite.add_statement(while_stmt)
+                self.suite.add_statement(SimpleStatement('"""unpyc3: ------------------------"""'))
 
         else:
             d_body = SuiteDecompiler(addr[1], end_addr)
-            while_stmt = WhileStatement(PyConst(True), d_body.suite)
-            d_body.stack.push(while_stmt)
+            d_body.end_while_condition = addr
             d_body.run()
-            while_stmt.body = d_body.suite
+            while_stmt = WhileStatement(PyConst(True), d_body.suite)
             self.suite.add_statement(while_stmt)
-            return jump_addr
-        return None
+        return jump_addr
 
     def BREAK_LOOP(self, addr):
         self.write("break")
@@ -1759,9 +2111,10 @@ class SuiteDecompiler:
         d_try = SuiteDecompiler(addr[1], start_finally)
         d_try.run()
         d_finally = SuiteDecompiler(start_finally)
+        d_finally.find_end_finally = True
         end_finally = d_finally.run()
         self.suite.add_statement(FinallyStatement(d_try.suite, d_finally.suite))
-        if end_finally:
+        if end_finally.opcode == END_FINALLY:
             return end_finally[1]
         else:
             return self.END_NOW
@@ -1785,6 +2138,9 @@ class SuiteDecompiler:
         d_try.run()
 
         stmt = TryStatement(d_try.suite)
+        fend = self.end_block
+        if end_try[-1].opcode == JUMP_FORWARD:
+            fend = end_try[-1].jump()
         j_except: Address = None
         while start_except.opcode != END_FINALLY:
             if start_except.opcode == DUP_TOP:
@@ -1793,7 +2149,9 @@ class SuiteDecompiler:
                 d_except.stack.push(stmt)
                 d_except.run()
                 start_except = stmt.next_start_except
-                j_except = start_except[-1]
+                if j_except is None or start_except[-1].opcode == JUMP_FORWARD or\
+                        j_except.opcode == RETURN_VALUE:
+                    j_except = start_except[-1]
                 end_addr = start_except[1]
             elif start_except.opcode == POP_TOP:
                 # It's a bare except clause - it starts:
@@ -1805,37 +2163,73 @@ class SuiteDecompiler:
                 start_except = start_except[3]
                 end_except = start_except
 
-                nested_try: int = 0
-                while end_except and end_except[-1].opcode != RETURN_VALUE:
+                while end_except < fend:
                     if end_except.opcode == SETUP_EXCEPT:
-                        nested_try += 1
-                    if end_except.opcode == POP_EXCEPT:
-                        if nested_try == 0:
-                            break
-                        nested_try -= 1
+                        nested_try = SuiteDecompiler(end_except, fend)
+                        nested_try = nested_try.SETUP_EXCEPT(end_except, end_except.arg)
+                    elif end_except.opcode == POP_EXCEPT:
+                        break
                     end_except = end_except[1]
-                # Handle edge case where there is a return in the except
-                if end_except[-1].opcode == RETURN_VALUE:
+                if end_except.opcode == POP_EXCEPT:
                     d_except = SuiteDecompiler(start_except, end_except)
-                    end_except = d_except.run()
+                    d_except.run()
                     stmt.add_except_clause(None, d_except.suite)
-                    self.suite.add_statement(stmt)
-                    return end_except
-
-                d_except = SuiteDecompiler(start_except, end_except)
-                end_except = d_except.run()
-                stmt.add_except_clause(None, d_except.suite)
-                start_except = end_except[2]
-                assert start_except.opcode == END_FINALLY
-
-                end_addr = start_except[1]
-                j_except: Address = end_except[1]
+                    start_except = end_except[2]
+                    assert start_except.opcode == END_FINALLY
+                    end_addr = start_except[1]
+                    if j_except is None or end_except[1].opcode == JUMP_FORWARD or\
+                            j_except.opcode == RETURN_VALUE:
+                        j_except: Address = end_except[1]
+                else:# Handle edge case where there is a return in the except
+                    if j_except and j_except.opcode == JUMP_FORWARD:
+                        if end_try[-1].opcode == JUMP_FORWARD:
+                            d_except = SuiteDecompiler(start_except, fend)
+                            d_except.run()
+                            stmt.add_except_clause(None, d_except.suite)
+                            end_addr = j_except.jump()
+                            d_else = SuiteDecompiler(fend, end_addr)
+                            d_else.run()
+                            stmt.else_suite = d_else.suite
+                            self.suite.add_statement(stmt)
+                            return end_addr
+                        else:
+                            end_addr = j_except.jump()
+                            d_except = SuiteDecompiler(start_except, end_addr)
+                            d_except.run()
+                            x = len(d_except.suite.statements)
+                            i = 0
+                            end_except = -1
+                            while i < x:
+                                stmt = d_except.suite.statements[i]
+                                if isinstance(stmt, SimpleStatement):
+                                    if stmt.val.startswith("return"):
+                                        end_except = i
+                                        break
+                                i = i + 1
+                            assert i >= 0
+                            if end_except + 1 < x:
+                                end_except = end_except + 1
+                                stmt.else_suite = Suite()
+                                stmt.else_suite.statements = d_except.suite.statements[end_except:]
+                                d_except.suite.statements = d_except.suite.statements[:end_except]
+                            stmt.add_except_clause(None, d_except.suite)
+                            self.suite.add_statement(stmt)
+                            return end_addr
+                    else:
+                        if fend == self.end_block:
+                            fend = self.end_addr
+                        d_except = SuiteDecompiler(start_except, fend)
+                        d_except.scan_for_else = True
+                        end_except = d_except.run()
+                        assert end_except.opcode == RETURN_VALUE
+                        stmt.add_except_clause(None, d_except.suite)
+                        self.suite.add_statement(stmt)
+                        return end_except[1]
+        
         self.suite.add_statement(stmt)
-        last_loop = addr.seek_back(SETUP_LOOP)
-        if last_loop and last_loop.jump() < addr:
-            last_loop = None
-        has_normal_else_clause = j_except and j_except.opcode == JUMP_FORWARD and j_except[2] != j_except.jump()
-        has_end_of_loop_else_clause = j_except.opcode == JUMP_ABSOLUTE and last_loop
+
+        has_normal_else_clause = j_except.opcode == JUMP_FORWARD and j_except[2] != j_except.jump()
+        has_end_of_loop_else_clause = j_except.opcode == JUMP_ABSOLUTE and j_except.is_continue_jump
         has_return_else_clause = j_except.opcode == RETURN_VALUE
         if has_normal_else_clause or has_end_of_loop_else_clause or has_return_else_clause:
             assert j_except[1].opcode == END_FINALLY
@@ -1846,15 +2240,18 @@ class SuiteDecompiler:
             if has_normal_else_clause:
                 end_else = j_except.jump()
             elif has_end_of_loop_else_clause:
-                end_else = last_loop.jump().seek_back(JUMP_ABSOLUTE)
+                end_try = end_try[-1]
+                if end_try.is_continue_jump:
+                    return end_addr
+                end_else = self.end_addr
             elif has_return_else_clause:
-                end_else = j_except[1].seek_forward(RETURN_VALUE)[1]
-            if has_return_else_clause and not end_else:
                 return end_addr
+                #end_else = j_except[1].seek_forward(RETURN_VALUE)[1]
+            #if has_return_else_clause and not end_else:
+                #return end_addr
             d_else = SuiteDecompiler(start_else, end_else)
-            end_addr = d_else.run()
-            if not end_addr:
-                end_addr = self.END_NOW
+            d_else.run()
+            end_addr = end_else
             stmt.else_suite = d_else.suite
         return end_addr
 
@@ -1885,6 +2282,7 @@ class SuiteDecompiler:
         return
 
     def SETUP_ANNOTATIONS(self, addr):
+        self.code.annotationd = True
         return
 
     def COMPARE_OP(self, addr, compare_opname):
@@ -1929,13 +2327,16 @@ class SuiteDecompiler:
     #
 
     def POP_TOP(self, addr):
+        if len(self.stack) <= 0:
+            self.suite.add_statement(SimpleStatement('"""unpyc3: decompilation error POP_TOP while empty stack"""'))
+            return
         self.stack.pop().on_pop(self)
 
     def ROT_TWO(self, addr: Address):
         # special case: x, y = z, t
 
-        if addr[-1].opcode in (LOAD_ATTR, LOAD_GLOBAL, LOAD_NAME, BINARY_SUBSCR, BUILD_LIST):
-            next_stmt = addr.seek_forward((*(stmt_opcodes- unpack_stmt_opcodes), *pop_jump_if_opcodes, *else_jump_opcodes))
+        if addr[-1].opcode in (LOAD_ATTR, LOAD_GLOBAL, LOAD_NAME, BINARY_SUBSCR, BUILD_LIST, CALL_FUNCTION):
+            next_stmt = addr.seek_forward((*unpack_terminators, *pop_jump_if_opcodes, *else_jump_opcodes))
             first = addr.seek_forward(unpack_stmt_opcodes, next_stmt)
             second = first and first.seek_forward(unpack_stmt_opcodes, next_stmt)
             if first and second and len({*[first.opcode, second.opcode]}) == 1:
@@ -1949,22 +2350,24 @@ class SuiteDecompiler:
         self.stack.push(tos, tos1)
 
     def ROT_THREE(self, addr: Address):
-        # special case: x, y, z = a, b, c
-        next_stmt = addr.seek_forward(unpack_terminators)
-        rot_two = addr[1]
-        first = rot_two and rot_two.seek_forward(unpack_stmt_opcodes, next_stmt)
-        second = first and first.seek_forward(unpack_stmt_opcodes, next_stmt)
-        third = second and second.seek_forward(unpack_stmt_opcodes, next_stmt)
-        if first and second and third and len({*[first.opcode, second.opcode,third.opcode]}) == 1:
-            val = PyTuple(self.stack.pop(3))
-            unpack = Unpack(val, 3)
-            self.stack.push(unpack)
-            self.stack.push(unpack)
-            self.stack.push(unpack)
-            return addr[2]
-        else:
-            tos2, tos1, tos = self.stack.pop(3)
-            self.stack.push(tos, tos2, tos1)
+        if not (addr[-1].opcode == DUP_TOP and addr[1].opcode == COMPARE_OP and\
+                addr[2].opcode in (JUMP_IF_FALSE_OR_POP, POP_JUMP_IF_FALSE, POP_JUMP_IF_TRUE)):
+            # special case: x, y, z = a, b, c
+            next_stmt = addr.seek_forward(unpack_terminators)
+            rot_two = addr[1]
+            first = rot_two and rot_two.seek_forward(unpack_stmt_opcodes, next_stmt)
+            second = first and first.seek_forward(unpack_stmt_opcodes, next_stmt)
+            third = second and second.seek_forward(unpack_stmt_opcodes, next_stmt)
+            if first and second and third and len({*[first.opcode, second.opcode,third.opcode]}) == 1:
+                val = PyTuple(self.stack.pop(3))
+                unpack = Unpack(val, 3)
+                self.stack.push(unpack)
+                self.stack.push(unpack)
+                self.stack.push(unpack)
+                return addr[2]
+        
+        tos2, tos1, tos = self.stack.pop(3)
+        self.stack.push(tos, tos2, tos1)
 
     def DUP_TOP(self, addr):
         self.stack.push(self.stack.peek())
@@ -2098,10 +2501,19 @@ class SuiteDecompiler:
         attrname = self.code.names[namei]
         self.write("del {}.{}", expr, attrname)
 
-    # SUBSCR
-
     def STORE_SUBSCR(self, addr):
         expr, sub = self.stack.pop(2)
+        if self.code.annotationd and isinstance(sub,PyConst) and isinstance(expr,PyName) and expr.name == '__annotations__':
+            newname = sub.val + ': ' + str(self.stack.pop())
+            if len(self.suite) >= 1:
+                lastst = self.suite[-1]
+                if isinstance(lastst, AssignStatement):
+                    sname = lastst.chain[0]
+                    if isinstance(sname, PyName) and sname.name == sub.val:
+                        lastst.chain[0] = PyName(newname)
+                        return
+            self.suite.add_statement(SimpleStatement(newname))
+            return
         self.store(PySubscript(expr, sub))
 
     def DELETE_SUBSCR(self, addr):
@@ -2130,7 +2542,7 @@ class SuiteDecompiler:
         # attributes and assignments and is difficult to workaround
         i = 1
         while addr[i].opcode == LOAD_ATTR: i = i + 1
-        if i > 1 and addr[i].opcode in (STORE_FAST, STORE_NAME):
+        if i > 1 and addr[i].opcode in (STORE_FAST, STORE_NAME, STORE_DEREF):
             return addr[i]
         return None
 
@@ -2138,8 +2550,8 @@ class SuiteDecompiler:
         name = self.code.names[namei]
         self.stack.push(ImportFrom(name))
         if addr[1].opcode == ROT_TWO:
-           return addr.seek_forward(STORE_NAME)
-
+            return addr.seek_forward((STORE_NAME, STORE_FAST, STORE_DEREF))
+        return None
 
     def IMPORT_STAR(self, addr):
         self.POP_TOP(addr)
@@ -2163,12 +2575,18 @@ class SuiteDecompiler:
             loop = WhileStatement(cond, body)
             self.suite.add_statement(loop)
             return
+        
         if isinstance(value, PyConst) and value.val is None:
-            if addr[1] is not None:
-                if self.code.flags.generator and addr[3] and not self.code[0].seek_forward({YIELD_FROM, YIELD_VALUE}):
+            value = self.code.flags.generator and not self.code[0].seek_forward({YIELD_FROM, YIELD_VALUE})
+            if addr[1] is not None or self.find_end_finally:
+                self.write("return")
+                if value:
+                    #and addr[3]
                     self.write('yield')
-                else:
+            else:
+                if value and not self.code[0].seek_forward(RETURN_VALUE, addr):
                     self.write("return")
+                    self.write('yield')
             return
         if self.code.flags.iterable_coroutine:
             self.write("yield {}", value)
@@ -2414,25 +2832,32 @@ class SuiteDecompiler:
 
     def JUMP_IF_FALSE_OR_POP(self, addr: Address, target):
         end_addr = addr.jump()
-        truthiness = not addr.seek_back_statement(POP_JUMP_IF_TRUE)
-        self.push_popjump(truthiness, end_addr, self.stack.pop(), addr)
+        if addr[-3] and \
+                addr[-1].opcode == COMPARE_OP and \
+                addr[-2].opcode == ROT_THREE and \
+                addr[-3].opcode == DUP_TOP:
+            curaddr = addr[1]
+            start_addr = curaddr
+            cond = self.stack.pop()
+            while curaddr < end_addr:
+                if curaddr.opcode == COMPARE_OP:
+                    if curaddr[-2].opcode == DUP_TOP and curaddr[-1].opcode == ROT_THREE and\
+                            curaddr[1].opcode == JUMP_IF_FALSE_OR_POP and curaddr[1].arg == addr.arg:
+                        d = SuiteDecompiler(start_addr, curaddr[1], self.stack)
+                        d.run()
+                        c = d.stack.pop()
+                        cond = cond.chain(c)
+                        start_addr = curaddr[2]
+                curaddr = curaddr[1]
+            d = SuiteDecompiler(start_addr, end_addr[-1], self.stack)
+            d.run()
+            c = d.stack.pop()
+            cond = cond.chain(c)
+            self.stack.push(cond)
+            return end_addr[2]
+        
+        self.push_popjump(False, end_addr, self.stack.pop(), addr)
         left = self.pop_popjump()
-        if end_addr.opcode == ROT_TWO:
-            opc, arg = end_addr[-1]
-            if opc == JUMP_FORWARD and arg == 2:
-                end_addr = end_addr[2]
-            elif opc == RETURN_VALUE or opc == JUMP_FORWARD:
-                end_addr = end_addr[-1]
-                d = SuiteDecompiler(addr[1], end_addr, self.stack)
-                d.run()
-                right = self.stack.pop()
-                if isinstance(right, PyCompare) and right.extends(left):
-                    py_and = left.chain(right)
-                else:
-                    py_and = PyBooleanAnd(left, right)
-                self.stack.push(py_and)
-                return end_addr[3]
-
         d = SuiteDecompiler(addr[1], end_addr, self.stack)
         d.run()
         # if end_addr.opcode == RETURN_VALUE:
@@ -2448,12 +2873,7 @@ class SuiteDecompiler:
     # This appears when there are chained comparisons, e.g. 1 <= x < 10
 
     def JUMP_FORWARD(self, addr, delta):
-        ## if delta == 2 and addr[1].opcode == ROT_TWO and addr[2].opcode == POP_TOP:
-        ##     # We're in the special case of chained comparisons
-        ##     return addr[3]
-        ## else:
-        ##     # I'm hoping its an unused JUMP in an if-else statement
-        ##     return addr[1]
+
         return addr.jump()
 
     # or operator
@@ -2475,48 +2895,113 @@ class SuiteDecompiler:
     def POP_JUMP_IF(self, addr: Address, target: int, truthiness: bool) -> Union[Address, None]:
         jump_addr = addr.jump()
         next_addr = addr[1]
+        j_addr = jump_addr
+        
+        wcontext = addr.last_loop_context()
+        last_loop = self.code[wcontext[0]]
+        in_loop = last_loop != None
+        is_loop_condition = wcontext[1] > 0 and addr.index <= wcontext[1]
+        
 
-        last_loop = addr.seek_back(SETUP_LOOP)
-        in_loop = last_loop and last_loop.jump() > addr
-        is_loop_condition = False
-        if in_loop:
-            end_addr = last_loop.jump()[-1]
-            end_cond = addr.seek_forward(stmt_opcodes).seek_back(pop_jump_if_opcodes)
-            while end_cond and end_cond.jump() != end_addr:
-                end_cond = end_cond.seek_back(pop_jump_if_opcodes)
-            is_loop_condition = end_cond == addr
-
-        end_of_loop = jump_addr.opcode == FOR_ITER or jump_addr[-1].opcode == SETUP_LOOP
-        if jump_addr.opcode == FOR_ITER:
-            # We are in a for-loop with nothing after the if-suite
-            # But take care: for-loops in generator expression do
-            # not end in POP_BLOCK, hence the test below.
-            jump_addr = jump_addr.jump()
-        elif end_of_loop:
-            # We are in a while-loop with nothing after the if-suite
-            jump_addr = jump_addr[-1].jump()[-1]
+        if addr.is_continue_jump:
+            c = None
+            if not addr in self.code.statement_jumps:
+                for x in self.code.statement_jumps:
+                    if addr < x:
+                        if c is None or x < c:
+                            c = x
+                assert c and c < self.end_block
+            if c and c[1].is_continue_jump and\
+                    (truthiness or not c.is_continue_jump):
+                jump_addr = c[1]
+            else:
+                if jump_addr.opcode == FOR_ITER:
+                    # We are in a for-loop with nothing after the if-suite
+                    # But take care: for-loops in generator expression do
+                    # not end in POP_BLOCK, hence the test below.
+                    jump_addr = jump_addr.jump()
+                elif jump_addr[-1].opcode == SETUP_LOOP:
+                    # We are in a while-loop with nothing after the if-suite
+                    jump_addr = jump_addr[-1].jump()[-1]
+        
         cond = self.stack.pop()
         # chained compare
         # ex:
         # if x <= y <= z:
-        if addr[-3] and \
-                addr[-1].opcode == COMPARE_OP and \
-                addr[-2].opcode == ROT_THREE and \
-                addr[-3].opcode == DUP_TOP:
-            if self.popjump_stack:
-                c = self.pop_popjump()
-                c = c.chain(cond)
-                self.push_popjump(not truthiness, jump_addr, c, addr)
-            else:
-                self.push_popjump(not truthiness, jump_addr, cond, addr)
+        if addr in self.code.start_chained_jumps:
+            self.push_popjump(truthiness, jump_addr, cond, addr)
             return
+        elif addr in self.code.inner_chained_jumps:
+            c = self.pop_popjump()
+            cond = c.chain(cond)
+            self.push_popjump(False, jump_addr, cond, addr)
+            return
+        elif addr in self.code.end_chained_jumps:
+            c = self.pop_popjump()
+            cond = c.chain(cond)
 
-        is_chained = isinstance(cond, PyCompare) and addr.seek_back(ROT_THREE, addr.seek_back(stmt_opcodes))
-        if is_chained and self.popjump_stack:
-            pj = self.pop_popjump()
-            if isinstance(pj, PyCompare):
-                cond = pj.chain(cond)
-
+        if addr in self.code.ternaryop_jumps:
+            x = jump_addr[-1]
+            self.push_popjump(truthiness, jump_addr, cond, addr)
+            cond = self.pop_popjump()
+            if x.opcode == RETURN_VALUE:# return (a if b else c)
+                d_true = SuiteDecompiler(next_addr, x)
+                d_true.run()
+                true_expr = d_true.stack.pop()
+                end_false = self.end_block
+                if not end_false.opcode == RETURN_VALUE:
+                    end_false = self.end_block.seek_back(RETURN_VALUE, jump_addr)#include nested ternary operators
+                d_false = SuiteDecompiler(jump_addr, end_false)
+                d_false.find_end_finally = True
+                d_false.run()
+                false_expr = d_false.stack.pop()
+                cond = PyIfElse(cond, true_expr, false_expr)
+                self.stack.push(cond)
+                return end_false
+            next_jump_addr = x.jump()
+            if addr[2] == jump_addr:
+                true_expr = PyConst(True)
+            else:
+                end_true = jump_addr[-2]
+                if end_true.opcode in pop_jump_if_opcodes:
+                    next_jump_addr = end_true
+                else:
+                    end_true = x
+                d_true = SuiteDecompiler(next_addr, end_true)
+                d_true.run()
+                true_expr = d_true.stack.pop()
+            if x.arg == 0:
+                false_expr = PyConst(True)
+                if addr[2] == jump_addr:# if (True if a else True):
+                    d_true = SuiteDecompiler(x[1], self.end_addr)
+                    d_true.run()
+                    stmt = d_true.suite.statements[0]
+                    x = Suite()
+                    x.add_statement(stmt)
+                    cond = PyIfElse(cond, true_expr, false_expr)
+                    self.push_popjump(truthiness, self.end_block, cond, addr)
+                    cond = self.pop_popjump()
+                    stmt = IfStatement(cond, x, None)
+                    self.suite.add_statement(stmt)
+                    self.suite.statements = self.suite.statements + d_true.suite.statements[1:]
+                    return self.END_NOW
+                cond = PyIfElse(cond, true_expr, false_expr)
+                self.push_popjump(truthiness, self.end_block, cond, addr)
+                cond = self.pop_popjump()
+            else:
+                x = x.jump()
+                end_false= x[-1]
+                if end_false.opcode in pop_jump_if_opcodes:
+                    next_jump_addr = end_false
+                else:
+                    end_false = x
+                d_false = SuiteDecompiler(jump_addr, end_false)
+                d_false.run()
+                false_expr = d_false.stack.pop()
+                cond = PyIfElse(cond, true_expr, false_expr)
+            self.stack.push(cond)
+            return next_jump_addr
+        
         if not addr.is_else_jump and not is_loop_condition:
             # Handle generator expressions with or clause
             for_iter = addr.seek_back(FOR_ITER)
@@ -2528,11 +3013,31 @@ class SuiteDecompiler:
                         if not truthiness:
                             truthiness = not truthiness
                             if truthiness:
-                                cond = PyNot(cond)
+                                cond = SPyNot(cond)
                         self.push_popjump(truthiness, jump_addr, cond, addr)
                         return None
 
+            #case if: pass else:
+            pass_addr = None
+            replace_addr = None
+            if not is_loop_condition and not addr.is_continue_jump:
+                x = addr[1]
+                while x < self.end_block:
+                    if x.is_statement:
+                        break
+                    if x.opcode == JUMP_FORWARD and x.addr in self.code.linemap:
+                        pass_addr = x
+                        replace_addr = x.jump()
+                        if replace_addr == j_addr:
+                            jump_addr = x
+                        break
+                    x = x[1]
+            
             self.push_popjump(truthiness, jump_addr, cond, addr)
+            
+            if not addr in self.code.statement_jumps and not addr in self.code.ternaryop_jumps:
+                return None
+            
             # Dictionary comprehension
             if jump_addr.seek_forward(MAP_ADD):
                 return None
@@ -2540,90 +3045,205 @@ class SuiteDecompiler:
             if addr.code.name=='<lambda>':
                 return None
             # Generator
-            if jump_addr.seek_forward(YIELD_VALUE, jump_addr.seek_forward(stmt_opcodes)):
-                return None
+            #if jump_addr.seek_forward(YIELD_VALUE, jump_addr.seek_stmt(None)):
+                #return None
 
             if jump_addr.seek_back(JUMP_IF_TRUE_OR_POP,jump_addr[-2]):
                 return None
             # Generator
-            if jump_addr.opcode != END_FINALLY and jump_addr[1] and jump_addr[1].opcode == JUMP_ABSOLUTE:
+            if addr.code.name == '<genexpr>' and jump_addr.opcode != END_FINALLY and jump_addr[1] and jump_addr[1].opcode == JUMP_ABSOLUTE:
                 return None
 
-            next_addr = addr[1]
-            while next_addr and next_addr < jump_addr:
-                if next_addr.opcode in stmt_opcodes:
-                    break
-                if next_addr.opcode in pop_jump_if_opcodes:
-                    next_jump_addr = next_addr.jump()
-                    if next_jump_addr > jump_addr or \
-                            (next_jump_addr == jump_addr and jump_addr[-1].opcode in else_jump_opcodes) or \
-                            (next_jump_addr[-1].opcode == SETUP_LOOP):
-                        return None
-                    if next_addr[1] == jump_addr and addr.arg != next_addr.arg:
-                        return None
-                    if next_jump_addr.opcode == FOR_ITER:
-                        return None
-                    if next_addr.opcode == addr.opcode and next_addr.arg == addr.arg:
-                        return None
-
-
-                if next_addr.opcode in (JUMP_IF_FALSE_OR_POP, JUMP_IF_TRUE_OR_POP):
-                    next_jump_addr = next_addr.jump()
-                    if next_jump_addr > jump_addr or (next_jump_addr == jump_addr and jump_addr[-1].opcode in else_jump_opcodes):
-                        return None
-                next_addr = next_addr[1]
-            # if there are no nested conditionals and no else clause, write the true portion and jump ahead to the end of the conditional
-            cond = self.pop_popjump()
             end_true = jump_addr
-            if jump_addr.opcode == JUMP_ABSOLUTE and in_loop:
-                end_true = end_true.seek_back(JUMP_ABSOLUTE, addr)
-            if truthiness and not isinstance(cond, PyBooleanOr):
-                cond = PyNot(cond)
+            if self.end_addr and jump_addr > self.end_addr:
+                end_true = self.end_addr
+            else:
+                #next_addr = addr[1]
+                x = addr.seek_stmt(jump_addr)
+                if x is None:
+                    x = jump_addr
+                while next_addr and next_addr < x:
+                    if next_addr.opcode in pop_jump_if_opcodes:
+                        next_jump_addr = next_addr.jump()
+                        if not is_loop_condition:
+                            if next_jump_addr == replace_addr:
+                                next_jump_addr = pass_addr
+                        #(next_jump_addr == jump_addr and jump_addr[-1].opcode in else_jump_opcodes) or 
+                        if next_jump_addr > jump_addr or \
+                                (next_jump_addr[-1].opcode == SETUP_LOOP):
+                            return None
+                        if next_addr[1] == jump_addr and addr.arg != next_addr.arg:
+                            return None
+                        if next_jump_addr.opcode == FOR_ITER:
+                            return None
+                        '''if next_addr.opcode == addr.opcode and next_addr.arg == addr.arg:
+                            return None'''
+
+                    if next_addr.opcode in (JUMP_IF_FALSE_OR_POP, JUMP_IF_TRUE_OR_POP):
+                        next_jump_addr = next_addr.jump()
+                        if next_jump_addr > jump_addr or (next_jump_addr == jump_addr and jump_addr[-1].opcode in else_jump_opcodes):
+                            return None
+                    next_addr = next_addr[1]
+                # if there are no nested conditionals and no else clause, write the true portion and jump ahead to the end of the conditional
+                if jump_addr.opcode == JUMP_ABSOLUTE and in_loop:
+                    end_true = end_true.seek_back(JUMP_ABSOLUTE, addr)
+            cond = self.pop_popjump()
             d_true = SuiteDecompiler(addr[1], end_true)
             d_true.run()
             stmt = IfStatement(cond, d_true.suite, None)
             self.suite.add_statement(stmt)
             return end_true
 
-
+        if not addr in self.code.statement_jumps and not addr in self.code.ternaryop_jumps:
+            self.push_popjump(truthiness, jump_addr, cond, addr)
+            return
+        
         end_true = jump_addr[-1]
+        if self.end_addr and jump_addr > self.end_addr:
+            if jump_addr == j_addr: #fast fix conflict with genexp.
+                end_true = self.end_addr
 
         is_assert = \
             end_true.opcode == RAISE_VARARGS and \
             next_addr.opcode == LOAD_GLOBAL and \
             next_addr.code.names[next_addr.arg].name == 'AssertionError'
-
-        # Increase jump_addr to pop all previous jumps
-        self.push_popjump(truthiness, jump_addr[1], cond, addr)
+        is_assert = False#By default the compiler generates nothing on assert statement
+        
+        if truthiness and addr.is_continue_jump and\
+                isinstance(cond, PyCompare) and cond.complist[1].startswith('is'):
+            c = next_addr
+            x = False
+            while c <= self.end_block:
+                if c.is_statement:
+                    break
+                if c.opcode in pop_jump_if_opcodes:
+                    x = True
+                elif c.opcode == JUMP_ABSOLUTE:
+                    if c.is_continue_jump:
+                        self.push_popjump(truthiness, c, cond, addr)
+                        return None
+                    else:
+                        break#what is it?
+                c = c[1]
+        
+        self.push_popjump(truthiness, jump_addr, cond, addr)
         cond = self.pop_popjump()
-
-        if truthiness:
-            x = addr.seek_back(pop_jump_if_opcodes, addr.seek_back(stmt_opcodes))
-
-            while x and x.jump() < addr.jump():
-                x = x.seek_back(pop_jump_if_opcodes)
-            last_pj = addr.seek_back(pop_jump_if_opcodes)
-            if not (x is not None and x.jump() == addr.jump()):
-                if last_pj and last_pj.arg != addr.arg and isinstance(cond, PyBooleanOr):
-                    if last_pj.opcode != addr.opcode:
-                        cond.right = PyNot(cond.right)
-                elif end_true.opcode and not is_assert:
-                    cond = PyNot(cond)
-
-        if end_true.opcode == RETURN_VALUE:
-            end_false = jump_addr.seek_forward(RETURN_VALUE)
-            if end_false and end_false[2] and end_false[2].opcode == RETURN_VALUE:
-                d_true = SuiteDecompiler(addr[1], end_true[1])
-                d_true.run()
-                d_false = SuiteDecompiler(jump_addr, end_false[1])
-                d_false.run()
+        
+        if addr in self.code.end_chained_jumps:
+            if next_addr.opcode == (JUMP_ABSOLUTE or next_addr.opcode == JUMP_FORWARD) and next_addr[1].opcode == POP_TOP:
+                next_addr = next_addr[3]
+        
+        if in_loop and addr.is_continue_jump:
+            d_true = SuiteDecompiler(next_addr, self.end_addr)
+            d_true.scan_for_else = True
+            end_true = d_true.run()
+            if end_true and end_true < self.end_block:
+                if end_true.opcode == JUMP_FORWARD:
+                    d_false = SuiteDecompiler(end_true[1], end_true.jump())
+                    d_false.run()
+                    self.suite.add_statement(IfStatement(cond, d_true.suite, d_false.suite))
+                    return end_true.jump()
+                elif end_true.opcode in (JUMP_ABSOLUTE, RETURN_VALUE):
+                    d_false = SuiteDecompiler(end_true[1], self.end_addr)
+                    d_false.run()
+                    end_false = None
+                    x = len(d_false.suite.statements)
+                    if x < 2:
+                        if x == 1:
+                            if self.end_block.addr in self.code.linemap:
+                                self.suite.add_statement(IfStatement(cond, d_true.suite, None))
+                                self.suite.add_statement(d_false.suite.statements[0])#continue
+                            else:
+                                self.suite.add_statement(IfStatement(cond, d_true.suite, d_false.suite))
+                        else:
+                            self.suite.add_statement(IfStatement(cond, d_true.suite, None))
+                        return self.END_NOW
+                    i = 1
+                    while i < (x - 1):
+                        stmt = d_false.suite.statements[i]
+                        if isinstance(stmt, SimpleStatement):
+                            if stmt.val == "continue":
+                                end_false = i
+                                break
+                            elif stmt.val.startswith("return"):
+                                end_false = i + 1
+                                break
+                        i = i + 1
+                    if end_false is None:
+                        if self.end_block.addr in self.code.linemap and self.end_block.opcode == JUMP_ABSOLUTE:
+                            self.suite.add_statement(IfStatement(cond, d_true.suite, None))
+                            self.suite.statements = self.suite.statements + d_false.suite.statements
+                        else:
+                            self.suite.add_statement(IfStatement(cond, d_true.suite, d_false.suite))
+                    else:
+                        self.suite.add_statement(IfStatement(cond, d_true.suite, d_false.suite))
+                        self.suite.statements = self.suite.statements + d_false.suite.statements[end_false:]
+                        d_false.suite.statements = d_false.suite.statements[:end_false]
+                    return self.END_NOW
+                else:
+                    raise Exception('scan_for_else: end_true<end_block.')
+            else:
+                end_true = None
+                x = len(d_true.suite.statements)
+                #assert x > 0
+                if x < 2:
+                    if next_addr == self.end_block and next_addr.is_continue_jump:
+                        d_true.suite.statements[0].val = "pass"
+                    self.suite.add_statement(IfStatement(cond, d_true.suite, None))
+                    return self.END_NOW
+                i = 1
+                while i < x:
+                    stmt = d_true.suite.statements[i]
+                    if isinstance(stmt, SimpleStatement) and stmt.val == "continue":
+                        end_true = i
+                        break
+                    i = i + 1
+                self.suite.add_statement(IfStatement(cond, d_true.suite, None))
+                if end_true is not None:
+                    #continue after if statement
+                    self.suite.statements = self.suite.statements + d_true.suite.statements[end_true:]
+                    d_true.suite.statements = d_true.suite.statements[:end_true]
+                return self.END_NOW
+        
+        if end_true.opcode == RETURN_VALUE and not addr.is_continue_jump and j_addr <= self.end_block:
+            d_true = SuiteDecompiler(next_addr, end_true[1])
+            d_true.run()
+            
+            d_false = SuiteDecompiler(j_addr, self.end_addr)
+            d_false.run()
+            end_false = None
+            x = len(d_false.suite.statements)
+            for i in range(x):
+                stmt = d_false.suite.statements[i]
+                if isinstance(stmt, SimpleStatement) and stmt.val.startswith("return"):
+                    if i < x - 1:
+                        if i < x - 2 or not isinstance(stmt, SimpleStatement):
+                            end_false = i
+                        else:
+                            stmt = d_false.suite.statements[i + 1]
+                            if not (isinstance(stmt, SimpleStatement) and stmt.val == "yield"):
+                                end_false = i
+                        break
+                    else:
+                        c = self.end_block[1]
+                        if self.end_block.opcode != RETURN_VALUE or\
+                                (c and (c.opcode == JUMP_FORWARD or (c.opcode == JUMP_ABSOLUTE and not c.addr in self.code.linemap))) or\
+                                (not self.end_addr and self.end_block[-1].opcode == LOAD_CONST and not self.end_block[-1].addr in self.code.linemap):
+                            end_false = i
+                            break
+            if end_false is None:
+                self.suite.add_statement(IfStatement(cond, d_true.suite, None))
+                self.suite.statements = self.suite.statements + d_false.suite.statements
+            else:
+                end_false = end_false + 1
                 self.suite.add_statement(IfStatement(cond, d_true.suite, d_false.suite))
-                self.last_addr = end_false[1]
-                return max(d_false.last_addr, d_false.end_addr)
+                self.suite.statements = self.suite.statements + d_false.suite.statements[end_false:]
+                d_false.suite.statements = d_false.suite.statements[:end_false]
+            return self.END_NOW
 
         if is_assert:
             # cond = cond.operand if isinstance(cond, PyNot) else PyNot(cond)
-            d_true = SuiteDecompiler(addr[1], end_true)
+            d_true = SuiteDecompiler(next_addr, end_true)
             d_true.run()
             assert_pop = d_true.stack.pop()
             assert_args = assert_pop.args if isinstance(assert_pop, PyCallFunction) else []
@@ -2634,44 +3254,92 @@ class SuiteDecompiler:
         # - If the true clause ends in RAISE_VARARGS, then it's an
         # assert statement. For now I just write it as a raise within
         # an if (see below)
-        if end_true.opcode in (RETURN_VALUE, RAISE_VARARGS, POP_TOP):
-            d_true = SuiteDecompiler(addr[1], end_true[1])
+        if end_true.opcode in (RAISE_VARARGS, POP_TOP):
+            d_true = SuiteDecompiler(next_addr, end_true[1])
             d_true.run()
             self.suite.add_statement(IfStatement(cond, d_true.suite, Suite()))
             return jump_addr
-        if is_chained and addr[1].opcode == JUMP_ABSOLUTE:
-            end_true = end_true[-2]
-        d_true = SuiteDecompiler(addr[1], end_true)
-        d_true.run()
-        if in_loop and not is_loop_condition and addr[1].opcode == JUMP_ABSOLUTE:
-            j = addr[1].jump()
-            l = last_loop[1]
-            while l.opcode not in stmt_opcodes:
-                if l == j:
-                    d_true.suite.add_statement(SimpleStatement('continue'))
-
+        
+        
+        
+        if j_addr > self.end_block:
+            d_true = SuiteDecompiler(next_addr, self.end_addr)
+            d_true.run()
+            
+            end_true = None
+            x = len(d_true.suite.statements)
+            for i in range(x):
+                stmt = d_true.suite.statements[i]
+                if isinstance(stmt, SimpleStatement) and stmt.val.startswith("return"):
+                    if i < x - 1 or self.end_block.is_continue_jump:
+                        end_true = i
+                        break
+            if end_true is None:
+                self.suite.add_statement(IfStatement(cond, d_true.suite, None))
+            else:
+                end_true = end_true + 1
+                self.suite.add_statement(IfStatement(cond, d_true.suite, None))
+                self.suite.statements = self.suite.statements + d_true.suite.statements[end_true:]
+                d_true.suite.statements = d_true.suite.statements[:end_true]
+            return self.END_NOW
+        
+        if in_loop and not is_loop_condition and end_true.is_continue_jump:
+            d_true = SuiteDecompiler(next_addr, j_addr)
+            if end_true.addr in self.code.linemap:
+                if (next_addr.index + 1 == j_addr.index) and (self.end_addr.index == wcontext[2]):
+                    d_false = SuiteDecompiler(j_addr, self.end_addr)
+                    d_false.run()
+                    stmt = d_false.suite.statements[-1]
+                    if isinstance(stmt, SimpleStatement) and stmt.val.startswith("return") and self.end_block.opcode == JUMP_ABSOLUTE:
+                        d_true.suite.add_statement(SimpleStatement('pass'))
+                        self.suite.add_statement(IfStatement(cond, d_true.suite, d_false.suite))
+                    else:
+                        d_true.suite.add_statement(SimpleStatement('continue'))
+                        self.suite.add_statement(IfStatement(cond, d_true.suite, None))
+                        self.suite.statements = self.suite.statements + d_false.suite.statements
+                    return self.END_NOW
+                else:
+                    d_true.run()
                     self.suite.add_statement(IfStatement(cond, d_true.suite, None))
-                    return addr[2]
-                l = l[1]
-
-        if jump_addr.opcode == POP_BLOCK and is_loop_condition:
-            # It's a while loop
-            stmt = WhileStatement(cond, d_true.suite)
-            self.suite.add_statement(stmt)
-            return jump_addr[1]
+                    return j_addr
+            else:
+                d_true.run()
+                d_false = SuiteDecompiler(j_addr, self.end_addr)
+                d_false.run()
+                self.suite.add_statement(IfStatement(cond, d_true.suite, d_false.suite))
+                
+                x = len(d_false.suite.statements)
+                for i in range(x):
+                    stmt = d_false.suite.statements[i]
+                    if isinstance(stmt, SimpleStatement) and stmt.val.startswith("return"):
+                        if x == 1 or i < x-1 or self.end_block.opcode == JUMP_ABSOLUTE:
+                            i = i + 1
+                            self.suite.statements = self.suite.statements + d_false.suite.statements[i:]
+                            d_false.suite.statements = d_false.suite.statements[:i]
+                            return self.END_NOW
+                i = 0
+                while i < x:
+                    stmt = d_false.suite.statements[i]
+                    if isinstance(stmt, SimpleStatement) and stmt.val == "continue":
+                        self.suite.statements = self.suite.statements + d_false.suite.statements[i:]
+                        d_false.suite.statements = d_false.suite.statements[:i]
+                        break
+                    i = i + 1
+                return self.END_NOW
+        
+        d_true = SuiteDecompiler(next_addr, end_true)
+        
         # It's an if-else (expression or statement)
         if end_true.opcode == JUMP_FORWARD:
             end_false = end_true.jump()
         elif end_true.opcode == JUMP_ABSOLUTE:
-            end_false = end_true.jump()
-            if end_false.opcode == FOR_ITER:
-                # We are in a for-loop with nothing after the else-suite
-                end_false = end_false.jump()[-1]
-            elif end_false[-1].opcode == SETUP_LOOP:
-                # We are in a while-loop with nothing after the else-suite
-                end_false = end_false[-1].jump()[-1]
-            if end_false.opcode == RETURN_VALUE:
-                end_false = end_false[1]
+            if end_true.is_continue_jump:
+                d_true.end_addr = end_true[1]
+                end_false = self.end_addr
+            else:
+                end_false = end_true.jump()
+                if end_false.opcode == RETURN_VALUE:
+                    end_false = end_false[1]
         elif end_true.opcode == RETURN_VALUE:
             # find the next RETURN_VALUE
             end_false = jump_addr
@@ -2690,6 +3358,7 @@ class SuiteDecompiler:
             # stmt = IfStatement(cond, d_true.suite, None)
             # self.suite.add_statement(stmt)
             # return jump_addr or self.END_NOW
+        d_true.run()
         d_false = SuiteDecompiler(jump_addr, end_false)
         d_false.run()
         if d_true.stack and d_false.stack:
@@ -2712,17 +3381,11 @@ class SuiteDecompiler:
         return self.POP_JUMP_IF(addr, target, truthiness=True)
 
     def JUMP_ABSOLUTE(self, addr, target):
-        # print("*** JUMP ABSOLUTE ***", addr)
         # return addr.jump()
 
-        # TODO: print out continue if not final jump
-        jump_addr = addr.jump()
-        if jump_addr[-1].opcode == SETUP_LOOP:
-            end_addr = jump_addr + jump_addr[-1].arg
-            last_jump = self.scan_for_final_jump(jump_addr, end_addr[-1])
-            if last_jump != addr:
-                pass
-        pass
+        if addr.is_continue_jump:
+            if addr.addr in self.code.linemap:
+                self.suite.add_statement(SimpleStatement('continue'))
 
     #
     # For loops
@@ -2985,4 +3648,4 @@ if __name__ == "__main__":
     if len(sys.argv) == 1:
         print('USAGE: {} <filename.pyc>'.format(sys.argv[0]))
     else:
-        print(decompile(sys.argv[1]))
+        print(decompile(sys.argv[1])) 
