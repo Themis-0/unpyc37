@@ -292,29 +292,31 @@ class Stack:
 def code_walker(code):
     l = len(code)
     code = array('B', code)
-    oparg = 0
     i = 0
+    if sys.version_info >= (3, 6):
+        while i < l:
+            op = code[i]
+            oparg = code[i + 1]
+            offset = 2
+            while op == EXTENDED_ARG:
+                op = code[i + offset]
+                oparg <<= 8
+                oparg |= code[i + offset + 1]
+                offset += 2
+            yield i, (op, oparg)
+            i += offset
+        return
     extended_arg = 0
-
+    oparg = 0
     while i < l:
         op = code[i]
         offset = 1
-        if sys.version_info >= (3, 6):
-            oparg = code[i + offset]
-            offset += 1
-        elif op >= HAVE_ARGUMENT:
+        if op >= HAVE_ARGUMENT:
             oparg = code[i + offset] + code[i + offset + 1] * 256 + extended_arg
             extended_arg = 0
-            offset += 2
+            offset = 3
         if op == EXTENDED_ARG:
-            if sys.version_info >= (3, 6):
-                op = code[i + offset]
-                offset += 1
-                oparg <<= 8
-                oparg |= code[i + offset]
-                offset += 1
-            else:
-                extended_arg = oparg * 65536
+            extended_arg = oparg * 65536
         yield i, (op, oparg)
         i += offset
 
@@ -4043,7 +4045,35 @@ if __name__ == "__main__":
     else:
         print(decompile(sys.argv[1]))
 
+import difflib
 import types
+import re
+# Code object comparison routines based on code written by Andrew from Sims 4 Studio
+#
+# Handle formatting dis() output of a code object in order to run through a diff process.
+code_obj_regex = re.compile(r'(.*)\(\<code object (.*) at 0x.*, file "(.*)", line (.*)>\)', re.RegexFlag.IGNORECASE)
+const_comp_regex = re.compile(r'([0-9]+ LOAD_CONST +)(\d+) \((.*)\)')
+
+def format_dis_lines(co):
+
+    def remove_line_number(s: str):
+        ix = s.index(' ', 5)
+        x = s[ix:].lstrip(' ')
+        return x
+
+    def clean_code_object_line(s: str):
+        # strip out any line numbers, filenames, or offsets
+        global code_obj_regex
+        b = code_obj_regex.match(s)
+        if b:
+            return s.replace(b.group(0), '{}<{}>'.format(b.group(1), b.group(2)))
+        return s
+
+    return list(
+               map(clean_code_object_line,
+                   map(remove_line_number,
+                       filter(None,
+                              dis.Bytecode(co).dis().split('\n')))))
 
 CODE_FLAGS = (0x0001, "OPTIMIZED",
     0x0002, "NEWLOCALS",
@@ -4070,7 +4100,7 @@ def remove_arg(s):
         return s
     return s[:ix]
 
-def compare_codeobjs(code_obj_expected, code_obj_tested):
+def compare_codeobjs(code_obj_expected, code_obj_tested, parent_names = ''):
     err_level = 0
     err_str = ''
     t_err_str = ''
@@ -4079,7 +4109,7 @@ def compare_codeobjs(code_obj_expected, code_obj_tested):
         tst = 'Tested: '
         for i in range(0, len(CODE_FLAGS), 2):
             v = CODE_FLAGS[i]
-            if (code_obj_expected.co_flags&v) != ode_obj_tested.co_flags&v:
+            if (code_obj_expected.co_flags&v) != code_obj_tested.co_flags&v:
                 if (code_obj_expected.co_flags&v):
                     t_err_str += CODE_FLAGS[i+1] + ' '
                 else:
@@ -4126,7 +4156,6 @@ def compare_codeobjs(code_obj_expected, code_obj_tested):
                     t_err_str += 'Constants mismatched: unable to compare code object {} to non-code object {}\n'.format(constant, code_obj_tested.co_consts[i])
             elif constant != code_obj_tested.co_consts[i]:
                 t_err_str +=  'Constant: {} != {}\n'.format(constant, code_obj_tested.co_consts[i])
-            idxc += 1
     if code_obj_tested.co_nlocals != code_obj_expected.co_nlocals:
         t_err_str += 'Differing number of locals: {} != {}\n'.format(code_obj_expected.co_nlocals, code_obj_tested.co_nlocals)
         t_err_str +=  '\tExpected: {}\n\tActual:   {}\n'.format(code_obj_expected.co_varnames, code_obj_tested.co_varnames)
@@ -4164,6 +4193,6 @@ def compare_codeobjs(code_obj_expected, code_obj_tested):
             dd = list(difflib.unified_diff(aa, bb))
             if not any(dd):
                 return err_str
-        err_str +=  '{0}\n{1}\n{0}\nEXPECTED:\n\t{2}\n{0}\nACTUAL:\n\t{3}\n{0}\nDIFF:\n\t{4}\n{0}\n'.format('='*80, code_obj_expected.co_name, str.join('\n\t', a), str.join('\n\t', b), str.join('\n\t', d))
+        err_str +=  parent_names + ':\n{0}\n{1}\n{0}\nEXPECTED:\n\t{2}\n{0}\nACTUAL:\n\t{3}\n{0}\nDIFF:\n\t{4}\n{0}\n'.format('='*80, code_obj_expected.co_name, str.join('\n\t', a), str.join('\n\t', b), str.join('\n\t', d))
     return err_str
  
