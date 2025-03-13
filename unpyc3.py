@@ -4045,35 +4045,44 @@ if __name__ == "__main__":
     else:
         print(decompile(sys.argv[1]))
 
+
+
+
 import difflib
 import types
 import re
+
 # Code object comparison routines based on code written by Andrew from Sims 4 Studio
 #
 # Handle formatting dis() output of a code object in order to run through a diff process.
 code_obj_regex = re.compile(r'(.*)\(\<code object (.*) at 0x.*, file "(.*)", line (.*)>\)', re.RegexFlag.IGNORECASE)
-const_comp_regex = re.compile(r'([0-9]+ LOAD_CONST +)(\d+) \((.*)\)')
+const_comp_regex = re.compile(r'([0-9]+ LOAD_CONST +)(\d+) (.*)')
 
-def format_dis_lines(co):
+def format_dis_lines(co, rep_map):
 
     def remove_line_number(s: str):
         ix = s.index(' ', 5)
         x = s[ix:].lstrip(' ')
+        if x.startswith('>>'):
+            x = x[3:].lstrip(' ')
         return x
 
     def clean_code_object_line(s: str):
         # strip out any line numbers, filenames, or offsets
-        global code_obj_regex
-        b = code_obj_regex.match(s)
+        global code_obj_regex, const_comp_regex
+        b = const_comp_regex.match(s)
         if b:
-            return s.replace(b.group(0), '{}<{}>'.format(b.group(1), b.group(2)))
+            i = int(b.group(2))
+            if i in rep_map:
+                return b.group(1) + rep_map[i]
+            b = code_obj_regex.match(s)
+            if b:
+                return s.replace(b.group(0), '{}<{}>'.format(b.group(1), b.group(2)))
         return s
 
     return list(
                map(clean_code_object_line,
-                   map(remove_line_number,
-                       filter(None,
-                              dis.Bytecode(co).dis().split('\n')))))
+                   map(remove_line_number, co)))
 
 CODE_FLAGS = (0x0001, "OPTIMIZED",
     0x0002, "NEWLOCALS",
@@ -4100,8 +4109,10 @@ def remove_arg(s):
         return s
     return s[:ix]
 
-def compare_codeobjs(code_obj_expected, code_obj_tested, parent_names = ''):
-    err_level = 0
+delim = '='*80 + '\n'
+
+def compare_codeobjs(code_obj_expected, code_obj_tested, parent_names = None):
+    parent_name = parent_names[0] + ':' if parent_names else ''
     err_str = ''
     t_err_str = ''
     if code_obj_expected.co_flags != code_obj_tested.co_flags:
@@ -4126,36 +4137,6 @@ def compare_codeobjs(code_obj_expected, code_obj_tested, parent_names = ''):
         for i in range(len(code_obj_expected.co_names)):
             if code_obj_expected.co_names[i] != code_obj_tested.co_names[i]:
                 t_err_str +=  'Global name: {} != {}\n'.format(code_obj_expected.co_names[i], code_obj_tested.co_names[i])
-    if len(code_obj_tested.co_consts) != len(code_obj_expected.co_consts):
-        t_err_str += 'Differing number of constants: {} != {}\n'.format(len(code_obj_expected.co_consts), len(code_obj_tested.co_consts))
-        t_err_str +=  '\tExpected: {}\n\tActual:   {}\n'.format(code_obj_expected.co_consts, code_obj_tested.co_consts)
-        i = 0
-        im = len(code_obj_expected.co_consts)
-        j = i
-        jm = len(code_obj_tested.co_consts)
-        while i < im and j < jm:
-            if type(code_obj_expected.co_consts[i]) is types.CodeType:
-                while j < jm and type(code_obj_tested.co_consts[j]) is not types.CodeType:
-                    j += 1
-                if j < jm:
-                    err_str += compare_codeobjs(code_obj_expected.co_consts[i], code_obj_tested.co_consts[j])
-            elif type(code_obj_tested.co_consts[j]) is types.CodeType:
-                while i < im and type(code_obj_expected.co_consts[i]) is not types.CodeType:
-                    i += 1
-                if i < im:
-                    err_str += compare_codeobjs(code_obj_expected.co_consts[i], code_obj_tested.co_consts[j])
-            i += 1
-            j += 1
-    else:
-        for i in range(len(code_obj_expected.co_consts)):
-            constant = code_obj_expected.co_consts[i]
-            if type(constant) is types.CodeType:
-                if type(code_obj_tested.co_consts[i]) is types.CodeType:
-                    err_str += compare_codeobjs(constant, code_obj_tested.co_consts[i])
-                else:
-                    t_err_str += 'Constants mismatched: unable to compare code object {} to non-code object {}\n'.format(constant, code_obj_tested.co_consts[i])
-            elif constant != code_obj_tested.co_consts[i]:
-                t_err_str +=  'Constant: {} != {}\n'.format(constant, code_obj_tested.co_consts[i])
     if code_obj_tested.co_nlocals != code_obj_expected.co_nlocals:
         t_err_str += 'Differing number of locals: {} != {}\n'.format(code_obj_expected.co_nlocals, code_obj_tested.co_nlocals)
         t_err_str +=  '\tExpected: {}\n\tActual:   {}\n'.format(code_obj_expected.co_varnames, code_obj_tested.co_varnames)
@@ -4180,19 +4161,156 @@ def compare_codeobjs(code_obj_expected, code_obj_tested, parent_names = ''):
             elif name != code_obj_tested.co_cellvars[idxc]:
                 t_err_str +=  'Cellvar name: {} != {}\n'.format(name, code_obj_tested.co_cellvars[idxc])
             idxc += 1
-    if t_err_str:
-        err_str += '{0}\n{1}\n{0}\n'.format('='*80, code_obj_expected.co_name) + t_err_str
-    a = format_dis_lines(code_obj_expected)
-    b = format_dis_lines(code_obj_tested)
-    d = list(difflib.unified_diff(a, b))
+    
+    ltc = len(code_obj_tested.co_consts)
+    lec = len(code_obj_expected.co_consts)
+    opc_e = list(code_walker(code_obj_expected.co_code))
+    opc_t = list(code_walker(code_obj_tested.co_code))
+    is_identical = len(opc_e) == len(opc_t)
+    if is_identical:
+        pairs_e = {i : [] for i in range(lec)}
+        pairs_t = {i : [] for i in range(ltc)}
+        for i in range(len(opc_e)):
+            _, (opcode_e, arg_e) = opc_e[i]
+            _, (opcode_t, arg_t) = opc_t[i]
+            if opcode_e != opcode_t:
+                is_identical = False
+                break
+            if opcode_e >= HAVE_ARGUMENT:
+                if opcode_e == LOAD_CONST:
+                    a = pairs_e[arg_e]
+                    if arg_t not in a:
+                        a.append(arg_t)
+                    a = pairs_t[arg_t]
+                    if arg_e not in a:
+                        a.append(arg_e)
+                elif arg_e != arg_t:
+                    is_identical = False
+                    break
+    if is_identical:
+        is_matched_consts = True
+        rep_e = {}
+        rep_t = {}
+        for i in range(lec):
+            a = pairs_e[i]
+            l = len(a)
+            if l:
+                ec = code_obj_expected.co_consts[i]
+                if type(ec) is types.CodeType:
+                    f = True
+                    for j in a:
+                        tc = code_obj_tested.co_consts[j]
+                        if type(tc) is types.CodeType:
+                            if is_matched_consts and ec.co_name != tc.co_name:
+                                is_matched_consts = False
+                            r = compare_codeobjs(ec, tc, (parent_name + code_obj_expected.co_name, i, j))
+                            if r:
+                                f = False
+                                err_str += r
+                        else:
+                            t_err_str += 'Constants mismatched: unable to compare code object ' + ec.co_name + ' to non-code object ' + str(tc) + '\n'
+                            f = False
+                            is_matched_consts = False
+                    if f:
+                        rep_e[i] = '<' + ec.co_name + '>'
+                        for j in a:
+                            r = pairs_t[j]
+                            if len(r) > 1:
+                                r.remove(i)
+                            else:
+                                rep_t[j] = i
+                elif l == 1 and len(pairs_t[a[0]]) == 1 and code_obj_expected.co_consts[i] == code_obj_tested.co_consts[a[0]]:
+                    rep_t[a[0]] = i
+                    rep_e[i] = None
+                else:
+                    is_matched_consts = False
+        if not is_matched_consts:
+            for i in rep_e.keys():
+                if rep_e[i] is None:
+                    rep_e[i] = '(' + str(code_obj_expected.co_consts[i]) + ')'
+            for i in rep_t.keys():
+                rep_t[i] = rep_e[rep_t[i]]
+            edis = [s for s in dis.Bytecode(code_obj_expected).dis().split('\n') if s]#filter(None, dis.Bytecode(code_obj_expected).dis().split('\n'))
+            tdis = [s for s in dis.Bytecode(code_obj_tested).dis().split('\n') if s]#filter(None, dis.Bytecode(code_obj_tested).dis().split('\n'))
+            a = format_dis_lines(edis, rep_e)
+            b = format_dis_lines(tdis, rep_t)
+            d = list(difflib.unified_diff(a, b))
+            
+            t_err_str += 'Constants:\n\tExpected: ' + \
+                str(code_obj_expected.co_consts) + '\n\tActual:   ' + str(code_obj_tested.co_consts) + '\n'
+            t_err_str += delim + 'EXPECTED:\n\t' + str.join('\n\t', edis) + '\n' + delim
+            t_err_str += '\nACTUAL:\n ' + str.join('\n ', tdis) + '\n' + delim + 'DIFF:\n ' + str.join('\n ', d) + '\n' + delim
+    else:
+        if ltc != lec:
+            t_err_str += 'Differing number of constants: {} != {}\n'.format(lec, ltc)
+            t_err_str +=  '\tExpected: {}\n\tActual:   {}\n'.format(code_obj_expected.co_consts, code_obj_tested.co_consts)
+        else:
+            is_matched_consts = True
+            for i in range(lec):
+                ec = code_obj_expected.co_consts[i]
+                if type(ec) is not types.CodeType:
+                    if ec != code_obj_tested.co_consts[i]:
+                        is_matched_consts = False
+                        break
+            if not is_matched_consts:
+                t_err_str += 'Constants mismatched:\n\tExpected: ' + \
+                    str(code_obj_expected.co_consts) + '\n\tActual:   ' + str(code_obj_tested.co_consts) + '\n'
 
-    if any(d):
-        if err_str == '':
-            aa = list(map(remove_arg,a))
-            bb = list(map(remove_arg,b))
-            dd = list(difflib.unified_diff(aa, bb))
-            if not any(dd):
-                return err_str
-        err_str +=  parent_names + ':\n{0}\n{1}\n{0}\nEXPECTED:\n\t{2}\n{0}\nACTUAL:\n\t{3}\n{0}\nDIFF:\n\t{4}\n{0}\n'.format('='*80, code_obj_expected.co_name, str.join('\n\t', a), str.join('\n\t', b), str.join('\n\t', d))
-    return err_str
- 
+        co_map = {}
+        for i in range(lec):
+            ec = code_obj_expected.co_consts
+            if type(ec) is types.CodeType:
+                if ec.co_name in co_map:
+                    co_map[ec.co_name][0].append(i)
+                else:
+                    co_map[ec.co_name] = ([i], [])
+        for j in range(ltc):
+            tc = code_obj_tested.co_consts[j]
+            if type(tc) is types.CodeType:
+                if tc.co_name in co_map:
+                    co_map[tc.co_name][1].append(j)
+                else:
+                    co_map[tc.co_name] = ([], [j])
+        for e_co_list, t_co_list in co_map.values():
+            e_co_len = len(e_co_list)
+            if e_co_len == 1:
+                i = e_co_list[0]
+                ec = code_obj_expected.co_consts[i]
+                for j in t_co_list:
+                    tc = code_obj_tested.co_consts[j]
+                    t_err_str += compare_codeobjs(ec, tc, (parent_name + code_obj_expected.co_name, i, j))
+            else:
+                t_co_len = len(t_co_list)
+                if t_co_len == 1:
+                    j = t_co_list[0]
+                    tc = code_obj_tested.co_consts[j]
+                    for i in e_co_list:
+                        ec = code_obj_expected.co_consts[i]
+                        t_err_str += compare_codeobjs(ec, tc, (parent_name + code_obj_expected.co_name, i, j))
+                else:
+                    for a in range(min(e_co_len, t_co_len)):
+                        i = e_co_list[a]
+                        j = t_co_list[a]
+                        ec = code_obj_expected.co_consts[i]
+                        tc = code_obj_tested.co_consts[j]
+                        t_err_str += compare_codeobjs(ec, tc, (parent_name + code_obj_expected.co_name, i, j))
+                    a = abs(e_co_len - t_co_len)
+                    if a:
+                        err_str += delim + str(a) + ' code objects has no pair to compare with\n' + delim
+        
+        edis = [s for s in dis.Bytecode(code_obj_expected).dis().split('\n') if s]#filter(None, dis.Bytecode(code_obj_expected).dis().split('\n'))
+        tdis = [s for s in dis.Bytecode(code_obj_tested).dis().split('\n') if s]#filter(None, dis.Bytecode(code_obj_tested).dis().split('\n'))
+        a = format_dis_lines(edis, ())
+        b = format_dis_lines(tdis, ())
+        d = list(difflib.unified_diff(a, b))
+        if any(d):
+            t_err_str += delim + 'EXPECTED:\n ' + str.join('\n ', edis) + '\n' + delim
+            t_err_str += '\nACTUAL:\n ' + str.join('\n ', tdis) + '\n' + delim + 'DIFF:\n\t' + str.join('\n\t', d) + '\n' + delim
+    
+    if t_err_str:
+        err_str += delim
+        if parent_names:
+            err_str += parent_name + '  (expected const ind: ' + \
+                str(parent_names[1]) + ' actual const ind: ' + str(parent_names[2]) + ')\n'
+        err_str += code_obj_expected.co_name + '\n' + delim + t_err_str + delim
+    return err_str 
