@@ -779,7 +779,7 @@ class Code:
             if opcode in (STORE_GLOBAL, STORE_NAME):
                 addrc = addr[-1]
                 opcode, arg = addrc
-                if arg > 4 and opcode in (BUILD_TUPLE, BUILD_LIST, BUILD_SET, BUILD_MAP):
+                if arg > 4 and opcode in (BUILD_TUPLE, BUILD_LIST, BUILD_SET, BUILD_MAP, BUILD_CONST_KEY_MAP):
                     num_lines = 0
                     addr = addrc[-1]
                     while addr and not addr.is_statement:
@@ -1473,7 +1473,7 @@ class FunctionDefinition:
         params = []
         for name in code_obj.co_varnames[:l]:
             if name in self.paramobjs:
-                params.append('{}:{}'.format(name, str(self.paramobjs[name])))
+                params.append(name + ':' + str(self.paramobjs[name]))
             else:
                 params.append(name)
         if self.defaults:
@@ -1488,12 +1488,14 @@ class FunctionDefinition:
         if kwcount:
             for i in range(kwcount):
                 name = code_obj.co_varnames[l + i]
-                if name in self.kwdefaults and name in self.paramobjs:
-                    kwparams.append("{}:{}={}".format(name, self.paramobjs[name], self.kwdefaults[name]))
+                if name in self.paramobjs:
+                    if name in self.kwdefaults:
+                        name += ':' + str(self.paramobjs[name]) + '=' + str(self.kwdefaults[name])
+                    else:
+                        name += ':' + str(self.paramobjs[name])
                 elif name in self.kwdefaults:
-                    kwparams.append("{}={}".format(name, self.kwdefaults[name]))
-                else:
-                    kwparams.append(name)
+                    name += '=' + str(self.kwdefaults[name])
+                kwparams.append(name)
             l += kwcount
         if code_obj.co_flags & VARARGS:
             name = code_obj.co_varnames[l]
@@ -2806,6 +2808,7 @@ class SuiteDecompiler:
             an = self.stack.pop()
             if isinstance(an, PyConst) and isinstance(an.val, str):
                 an = an.val
+                #an = "'"+repr(an.val+'\"')[1:-2]+"'")
             else:
                 an = str(an)
             newname = sub.val + ': ' + an
@@ -3044,7 +3047,7 @@ class SuiteDecompiler:
         values = [self.stack.pop() for i in range(count)]
         values.reverse()
         num_lines = self.code.implicit_continuation.get(addr.index, 1)
-        self.stack.push(PyList(values))
+        self.stack.push(PyList(values, num_lines))
 
     def BUILD_LIST_UNPACK(self, addr, count):
         values = []
@@ -3100,7 +3103,8 @@ class SuiteDecompiler:
     def BUILD_CONST_KEY_MAP(self, addr, count):
         keys = self.stack.pop()
         vals = self.stack.pop(count)
-        dict = PyDict()
+        num_lines = self.code.implicit_continuation.get(addr.index, 1)
+        dict = PyDict(num_lines)
         for i in range(count):
             dict.set_item(PyConst(keys.val[i]), vals[i])
         self.stack.push(dict)
@@ -4103,11 +4107,7 @@ CODE_FLAGS = (0x0001, "OPTIMIZED",
     0x40000, "FUTURE_BARRY_AS_BDFL",
     0x80000, "FUTURE_GENERATOR_STOP",
     0x100000, "FUTURE_ANNOTATIONS")
-def remove_arg(s):
-    ix = s.find('(')
-    if ix <= 0:
-        return s
-    return s[:ix]
+
 
 delim = '='*80 + '\n'
 
@@ -4230,8 +4230,8 @@ def compare_codeobjs(code_obj_expected, code_obj_tested, parent_names = None):
                     rep_e[i] = '(' + str(code_obj_expected.co_consts[i]) + ')'
             for i in rep_t.keys():
                 rep_t[i] = rep_e[rep_t[i]]
-            edis = [s for s in dis.Bytecode(code_obj_expected).dis().split('\n') if s]#filter(None, dis.Bytecode(code_obj_expected).dis().split('\n'))
-            tdis = [s for s in dis.Bytecode(code_obj_tested).dis().split('\n') if s]#filter(None, dis.Bytecode(code_obj_tested).dis().split('\n'))
+            edis = [s for s in dis.Bytecode(code_obj_expected).dis().split('\n') if s]
+            tdis = [s for s in dis.Bytecode(code_obj_tested).dis().split('\n') if s]
             a = format_dis_lines(edis, rep_e)
             b = format_dis_lines(tdis, rep_t)
             d = list(difflib.unified_diff(a, b))
@@ -4258,7 +4258,7 @@ def compare_codeobjs(code_obj_expected, code_obj_tested, parent_names = None):
 
         co_map = {}
         for i in range(lec):
-            ec = code_obj_expected.co_consts
+            ec = code_obj_expected.co_consts[i]
             if type(ec) is types.CodeType:
                 if ec.co_name in co_map:
                     co_map[ec.co_name][0].append(i)
@@ -4271,35 +4271,35 @@ def compare_codeobjs(code_obj_expected, code_obj_tested, parent_names = None):
                     co_map[tc.co_name][1].append(j)
                 else:
                     co_map[tc.co_name] = ([], [j])
-        for e_co_list, t_co_list in co_map.values():
+        for co_name, (e_co_list, t_co_list) in co_map.items():
             e_co_len = len(e_co_list)
-            if e_co_len == 1:
+            t_co_len = len(t_co_list)
+            if e_co_len == 1 and t_co_len:
                 i = e_co_list[0]
                 ec = code_obj_expected.co_consts[i]
                 for j in t_co_list:
                     tc = code_obj_tested.co_consts[j]
                     t_err_str += compare_codeobjs(ec, tc, (parent_name + code_obj_expected.co_name, i, j))
+            elif t_co_len == 1 and e_co_len:
+                j = t_co_list[0]
+                tc = code_obj_tested.co_consts[j]
+                for i in e_co_list:
+                    ec = code_obj_expected.co_consts[i]
+                    t_err_str += compare_codeobjs(ec, tc, (parent_name + code_obj_expected.co_name, i, j))
             else:
-                t_co_len = len(t_co_list)
-                if t_co_len == 1:
-                    j = t_co_list[0]
+                for a in range(min(e_co_len, t_co_len)):
+                    i = e_co_list[a]
+                    j = t_co_list[a]
+                    ec = code_obj_expected.co_consts[i]
                     tc = code_obj_tested.co_consts[j]
-                    for i in e_co_list:
-                        ec = code_obj_expected.co_consts[i]
-                        t_err_str += compare_codeobjs(ec, tc, (parent_name + code_obj_expected.co_name, i, j))
-                else:
-                    for a in range(min(e_co_len, t_co_len)):
-                        i = e_co_list[a]
-                        j = t_co_list[a]
-                        ec = code_obj_expected.co_consts[i]
-                        tc = code_obj_tested.co_consts[j]
-                        t_err_str += compare_codeobjs(ec, tc, (parent_name + code_obj_expected.co_name, i, j))
-                    a = abs(e_co_len - t_co_len)
-                    if a:
-                        err_str += delim + str(a) + ' code objects has no pair to compare with\n' + delim
+                    t_err_str += compare_codeobjs(ec, tc, (parent_name + code_obj_expected.co_name, i, j))
+                a = abs(e_co_len - t_co_len)
+                if a:
+                    err_str += delim + parent_name + code_obj_expected.co_name + '\n' + \
+                    co_name +'\n' + str(a) + ' code objects has no pair to compare with\n' + delim
         
-        edis = [s for s in dis.Bytecode(code_obj_expected).dis().split('\n') if s]#filter(None, dis.Bytecode(code_obj_expected).dis().split('\n'))
-        tdis = [s for s in dis.Bytecode(code_obj_tested).dis().split('\n') if s]#filter(None, dis.Bytecode(code_obj_tested).dis().split('\n'))
+        edis = [s for s in dis.Bytecode(code_obj_expected).dis().split('\n') if s]
+        tdis = [s for s in dis.Bytecode(code_obj_tested).dis().split('\n') if s]
         a = format_dis_lines(edis, ())
         b = format_dis_lines(tdis, ())
         d = list(difflib.unified_diff(a, b))
