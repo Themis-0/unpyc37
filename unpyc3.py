@@ -1054,11 +1054,12 @@ class PyConst(PyExpr):
             l.sort()
             vals = ', '.join(map(repr,l))
             return f'{{{vals}}}'
-        elif isinstance(self.val, str) and len(self.val) > 20 and '\0' not in self.val and '\x01' not in self.val:
+        elif isinstance(self.val, str) and len(self.val) > 30 and '\n' in self.val:
             splt = self.val.split('\n')
-            if len(splt) > 1:
-                return '\"\"\"' + '\n'.join(map(lambda s: s.replace('\\', '\\\\').replace('"', '\\"'), splt)) \
-                       + '\"\"\"'
+            if '"' in self.val:
+                return '\'\'\'' + '\n'.join(map(lambda s: repr(s+'\"')[1:-2], splt)) + '\'\'\''
+            else:
+                return '\"\"\"' + '\n'.join(map(lambda s: repr(s)[1:-1], splt)) + '\"\"\"'
         return repr(self.val)
 
     def __iter__(self):
