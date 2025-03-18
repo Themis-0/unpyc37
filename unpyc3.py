@@ -20,13 +20,48 @@ def foo(x, y, z=3, *args):
             return
 >>>
 """
+
+"""
+           compare_codeobjs
+
+Returns a string of errors found, or an empty string for a perfect comparison result
+
+import marshal
+import unpyc3
+try:
+    lines = unpyc3.decompile("d:/hiscode.pyc")
+except:
+    print("Decompile failed (crash)")
+    return
+src_code = '\n'.join(map(str, lines)) + '\n'
+with open("d:/hiscode.py", 'w', encoding='UTF-8') as fp:
+    fp.write(src_code)
+try:
+    py_codeobj = compile(src_code, "hiscode.py", 'exec')
+except:
+    print("Syntax error in decompiled")
+    return
+with open("d:/hiscode.pyc", 'rb') as fp:
+    pyc_codeobj = marshal.loads(fp.read()[16:])
+issues = unpyc3.compare_codeobjs(pyc_codeobj, py_codeobj)
+if issues:
+    print("Blunders or just collisions in decompiled")
+    with open("d:/hiscode_issues.py", 'w', encoding='UTF-8') as fp:
+        fp.write(issues)
+"""
 from __future__ import annotations
 
 from typing import Union, Iterable, Any, List
 
 __all__ = ['decompile']
 
-
+"""
+logdata=''
+def unpyclog(*args):
+    global logdata
+    logdata = logdata + ''.join(map(str, args)) + "\n"
+unpyc3.set_trace(unpyclog)
+"""
 def set_trace(trace_function):
     global current_trace
     current_trace = trace_function if trace_function else _trace
@@ -288,6 +323,8 @@ class Stack:
         else:
             return self._stack[-count:]
 
+    def trace(self):
+        return ('_stack', '_counts')
 
 def code_walker(code):
     l = len(code)
@@ -2639,7 +2676,7 @@ class SuiteDecompiler:
                 next_stmt = self.end_addr
             first = addr.seek_forward(unpack_stmt_opcodes, next_stmt)
             second = first and first.seek_forward(unpack_stmt_opcodes, next_stmt)
-            if first and second and len({*[first.opcode, second.opcode]}) == 1:
+            if first and second:
                 val = PyTuple(self.stack.pop(2))
                 unpack = Unpack(val, 2)
                 self.stack.push(unpack)
@@ -2660,7 +2697,7 @@ class SuiteDecompiler:
             first = rot_two and rot_two.seek_forward(unpack_stmt_opcodes, next_stmt)
             second = first and first.seek_forward(unpack_stmt_opcodes, next_stmt)
             third = second and second.seek_forward(unpack_stmt_opcodes, next_stmt)
-            if first and second and third and len({*[first.opcode, second.opcode,third.opcode]}) == 1:
+            if first and second and third:
                 val = PyTuple(self.stack.pop(3))
                 unpack = Unpack(val, 3)
                 self.stack.push(unpack)
@@ -2808,8 +2845,7 @@ class SuiteDecompiler:
         if self.code.annotationd and isinstance(sub,PyConst) and isinstance(expr,PyName) and expr.name == '__annotations__':
             an = self.stack.pop()
             if isinstance(an, PyConst) and isinstance(an.val, str):
-                an = an.val
-                #an = "'"+repr(an.val+'\"')[1:-2]+"'")
+                an = an.val if self.code.flags.future_annotations else repr(an.val)
             else:
                 an = str(an)
             newname = sub.val + ': ' + an
@@ -3809,13 +3845,12 @@ class SuiteDecompiler:
             end_of_loop = loop.jump()
             if end_of_loop > self.end_block:
                 end_of_loop = self.end_addr
-            if end_of_loop.opcode != POP_BLOCK:
-                else_start = jump_addr[1]
-                if else_start < end_of_loop:
-                    d_else = SuiteDecompiler(else_start, end_of_loop)
-                    d_else.run()
-                    for_stmt.else_body = d_else.suite
-                    end_addr = end_of_loop
+            else_start = jump_addr[1]
+            if else_start < end_of_loop:
+                d_else = SuiteDecompiler(else_start, end_of_loop)
+                d_else.run()
+                for_stmt.else_body = d_else.suite
+                end_addr = end_of_loop
         self.suite.add_statement(for_stmt)
         return end_addr
 
@@ -4109,9 +4144,11 @@ CODE_FLAGS = (0x0001, "OPTIMIZED",
     0x80000, "FUTURE_GENERATOR_STOP",
     0x100000, "FUTURE_ANNOTATIONS")
 
-
 delim = '='*80 + '\n'
 
+
+#Returns a string of errors found, or an empty string for a perfect comparison result
+#parent_names - for internal recursive calls
 def compare_codeobjs(code_obj_expected, code_obj_tested, parent_names = None):
     parent_name = parent_names[0] + ':' if parent_names else ''
     err_str = ''
@@ -4237,14 +4274,17 @@ def compare_codeobjs(code_obj_expected, code_obj_tested, parent_names = None):
             b = format_dis_lines(tdis, rep_t)
             d = list(difflib.unified_diff(a, b))
             
-            t_err_str += 'Constants:\n\tExpected: ' + \
-                str(code_obj_expected.co_consts) + '\n\tActual:   ' + str(code_obj_tested.co_consts) + '\n'
+            t_err_str += 'Constants:\n  Expected:\n\t ' + \
+                    '\n\t'.join(map(repr, code_obj_expected.co_consts)) + \
+                    '\n  Actual:   ' + '\n\t'.join(map(repr, code_obj_tested.co_consts)) + '\n'
             t_err_str += delim + 'EXPECTED:\n\t' + str.join('\n\t', edis) + '\n' + delim
             t_err_str += '\nACTUAL:\n ' + str.join('\n ', tdis) + '\n' + delim + 'DIFF:\n ' + str.join('\n ', d) + '\n' + delim
     else:
         if ltc != lec:
             t_err_str += 'Differing number of constants: {} != {}\n'.format(lec, ltc)
-            t_err_str +=  '\tExpected: {}\n\tActual:   {}\n'.format(code_obj_expected.co_consts, code_obj_tested.co_consts)
+            t_err_str +=  '  Expected:\n\t ' + \
+                    '\n\t'.join(map(repr, code_obj_expected.co_consts)) + \
+                    '\n  Actual:   ' + '\n\t'.join(map(repr, code_obj_tested.co_consts)) + '\n'
         else:
             is_matched_consts = True
             for i in range(lec):
@@ -4254,8 +4294,9 @@ def compare_codeobjs(code_obj_expected, code_obj_tested, parent_names = None):
                         is_matched_consts = False
                         break
             if not is_matched_consts:
-                t_err_str += 'Constants mismatched:\n\tExpected: ' + \
-                    str(code_obj_expected.co_consts) + '\n\tActual:   ' + str(code_obj_tested.co_consts) + '\n'
+                t_err_str += 'Constants mismatched:\n\  Expected:\n\t ' + \
+                    '\n\t'.join(map(repr, code_obj_expected.co_consts)) + \
+                    '\n  Actual:   ' + '\n\t'.join(map(repr, code_obj_tested.co_consts)) + '\n'
 
         co_map = {}
         for i in range(lec):
