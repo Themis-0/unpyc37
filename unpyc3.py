@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 Decompiler for Python3.7.
 Decompile a module or a function using the decompile() function
@@ -49,7 +50,7 @@ if issues:
     with open("d:/hiscode_issues.py", 'w', encoding='UTF-8') as fp:
         fp.write(issues)
 """
-from __future__ import annotations
+
 
 from typing import Union, Iterable, Any, List
 
@@ -536,6 +537,42 @@ class Code:
                         c = c + 1
                 starta = starta[1]
             return c
+        def find_start_of_true_suit(curaddr):
+            last_jump = None
+            x = None
+            while curaddr < next_stmt:
+                if curaddr.opcode in pop_jump_if_opcodes:
+                    if curaddr.arg > next_stmt.addr or curaddr.arg < addr.addr or\
+                            (curaddr[2] == curaddr.jump() and curaddr[1].opcode == JUMP_FORWARD and curaddr[1].jump() > next_stmt):#  <--   if a: pass else:
+                        if last_jump is None:
+                            last_jump = curaddr
+                            if curaddr.arg < addr.addr and next_stmt.is_continue_jump:
+                                x = curaddr# jump to true suite
+                        elif last_jump.arg == curaddr.arg:
+                            last_jump = curaddr
+                        elif x is not None:
+                            if x.arg == last_jump.arg:
+                                c = curaddr.jump()
+                                if (len(self.statement_jumps) and curaddr.arg >= self.statement_jumps[-1].addr) or\
+                                        (len(self.loops) and c.index >= self.loops[-1][2]):
+                                    #last_jump = x
+                                    x = None
+                                    break
+                                if c.opcode == JUMP_ABSOLUTE and c.is_continue_jump and\
+                                        c.addr in self.linemap and\
+                                        c[-1].opcode == JUMP_FORWARD and c[-2].opcode != POP_TOP:
+                                    #last_jump = x
+                                    x = None
+                                    break
+                                last_jump = curaddr
+                            else:
+                                #last_jump = x
+                                x = None
+                                break
+                        else:
+                            break
+                curaddr = curaddr[1]
+            return last_jump
         i = 0
         while i < len(self.instr_seq):
             addr = Address(self, i)
@@ -616,158 +653,28 @@ class Code:
                         jt = end_addr
                     self.loops.append((addr.index, end_cond, jt.index))
                 elif opcode in pop_jump_if_opcodes:
-                    next_stmt = addr.seek_stmt(None)
-                    #find start true
-                    curaddr = addr
-                    lastjump = None
-                    x = None
-                    while curaddr < next_stmt:
-                        if curaddr.opcode in pop_jump_if_opcodes:
-                            if curaddr.arg > next_stmt.addr or curaddr.arg < addr.addr or\
-                                    (curaddr[2] == curaddr.jump() and curaddr[1].opcode == JUMP_FORWARD and curaddr[1].jump() > next_stmt):#  <--   if a: pass else:
-                                if lastjump is None:
-                                    lastjump = curaddr
-                                    if curaddr.arg < addr.addr and next_stmt.is_continue_jump:
-                                        x = curaddr# jump to true suite
-                                elif lastjump.arg == curaddr.arg:
-                                    lastjump = curaddr
-                                elif x is not None:
-                                    if x.arg == lastjump.arg:
-                                        c = curaddr.jump()
-                                        if (len(self.statement_jumps) and curaddr.arg >= self.statement_jumps[-1].addr) or\
-                                                (len(self.loops) and c.index >= self.loops[-1][2]):
-                                            #lastjump = x
-                                            x = None
-                                            break
-                                        if c.opcode == JUMP_ABSOLUTE and c.is_continue_jump and\
-                                                c.addr in self.linemap and\
-                                                c[-1].opcode == JUMP_FORWARD and c[-2].opcode != POP_TOP:
-                                            #lastjump = x
-                                            x = None
-                                            break
-                                        lastjump = curaddr
-                                    else:
-                                        #lastjump = x
-                                        x = None
-                                        break
-                                else:
-                                    break
-                        curaddr = curaddr[1]
-                    
-                    if self.name in ('<listcomp>','<setcomp>','<dictcomp>','<genexpr>'):
-                        self.statement_jumps.append(lastjump)
-                        lastjump = None
-                    elif self.name == '<lambda>':
-                        lastjump = None
-                    if lastjump:
-                        qcjumps = []
-                        start_true = pj_start_true(lastjump)
-                        curjump = addr
-                        dto = addr
-                        while curjump < start_true:
-                            curjump = proc_chained(self, curjump)
-                            x = curjump.jump()[-1]
-                            if curjump.addr < curjump.arg <= next_stmt.addr and\
-                                    x.opcode == JUMP_FORWARD and\
-                                    x[-1].opcode != POP_TOP:
-                                curaddr = curjump[1]
-                                while curaddr < x:
-                                    if curaddr.opcode in pop_jump_if_opcodes and\
-                                            curaddr.arg == curjump.arg:# aa or (a if b else True)
-                                        curaddr = None
-                                        break
-                                    curaddr = curaddr[1]
-                                if curaddr:
-                                    if x.jump() > next_stmt or x.addr in self.linemap:#  if a: pass else:
-                                        self.statement_jumps.append(curjump)
-                                    else:
-                                        self.ternaryop_jumps.append(curjump)
-                                        if x > dto:
-                                            dto = x.jump()[-2]#-2 in case if (a if b else True):
-                            elif curjump.arg == start_true.addr:# if a or
-                                dto = lastjump
-                            elif curjump.addr < curjump.arg < start_true.addr:
-                                if x > dto:
-                                    dto = x
-                            else:
-                                if dto <= curjump:
-                                    if pj_start_true(curjump).addr in self.linemap:
-                                        if curjump not in self.statement_jumps:
-                                            curaddr = curjump[1]
-                                            if curjump.is_continue_jump:
-                                                #detect if a: if b or c:
-                                                if curjump != lastjump and curjump.arg != lastjump.arg:# only or
-                                                    if start_true.opcode == JUMP_ABSOLUTE and start_true.arg == curjump.arg:
-                                                        while curaddr < lastjump:
-                                                            if curaddr.opcode in pop_jump_if_opcodes and\
-                                                                    curaddr.arg > lastjump.arg:
-                                                                curaddr = None
-                                                                break
-                                                            curaddr = curaddr[1]
-                                                        if curaddr is None:
-                                                            curaddr = curjump#flag statement jump
-                                                        else:
-                                                            dto = lastjump
-                                                            curaddr = None#flag no statement
-                                                            qcjumps.append(curjump)
-                                            elif x.opcode == JUMP_FORWARD or\
-                                                    (x.opcode == JUMP_ABSOLUTE and x.arg > curjump.arg):
-                                                while curaddr <= lastjump:# < x:
-                                                    if curaddr.opcode in pop_jump_if_opcodes and\
-                                                            curaddr.arg == curjump.arg:# if a and b:...else:
-                                                        curaddr = None
-                                                        break
-                                                    curaddr = curaddr[1]
-                                            if curaddr:
-                                                self.statement_jumps.append(curjump)# just if a:
-                                    elif curjump == lastjump:
-                                        if next_stmt.opcode == RETURN_VALUE:
-                                            self.ternaryop_jumps.append(curjump)# return (a if b else c)
-                                    if curjump in self.statement_jumps and len(qcjumps):
-                                        if curjump == lastjump:
-                                            if len(self.statement_jumps) < 2 or not self.statement_jumps[-2].is_continue_jump:
-                                                enda = Address(self, self.loops[-1][2])
-                                                if len(self.statement_jumps) > 1 and self.statement_jumps[-2] > anda:
-                                                    enda = self.statement_jumps[-2].jump()
-                                                c = 0
-                                                if x.opcode != JUMP_ABSOLUTE or x.arg < enda.addr:
-                                                    if x.opcode == JUMP_ABSOLUTE and x != next_stmt:
-                                                        if x.arg < x.addr:
-                                                            starta = x[1]
-                                                            c = 2
-                                                        else:
-                                                            starta = x.jump()
-                                                            c = 1
-                                                    elif x.opcode == JUMP_FORWARD:
-                                                        starta = x.jump()
-                                                        c = 1
-                                                    elif x.opcode == RETURN_VALUE:
-                                                        starta = x[1]
-                                                        c = 2
-                                                    else:
-                                                        starta = x[1]
-                                                        c = 1
-                                                c = count_returns(starta, enda) - c
-                                                while c > 0 and len(qcjumps):
-                                                    x = qcjumps[-1]
-                                                    self.statement_jumps.append(x)
-                                                    qcjumps.remove(x)
-                                                    c = c - 1
-                                        self.qcjumps = self.qcjumps + qcjumps
-                                        qcjumps = []
-                            curjump = curjump[1]
-                            while curjump < start_true:
-                                if curjump.opcode in pop_jump_if_opcodes:
-                                    break
-                                curjump = curjump[1]
-                        i = start_true.index - 1
+                    if jt == addr[1]:
+                        self.statement_jumps.append(addr)
                     else:
-                        curjump = addr
-                        while curjump < next_stmt:
-                            curjump = proc_chained(self, curjump)
-                            if curjump.addr < curjump.arg <= next_stmt.addr:
+                        next_stmt = addr.seek_stmt(None)
+                        if self.name == '<lambda>':
+                            lastjump = None
+                        else:
+                            lastjump = find_start_of_true_suit(addr)
+                            if self.name in ('<listcomp>','<setcomp>','<dictcomp>','<genexpr>'):
+                                self.statement_jumps.append(lastjump)
+                                lastjump = None
+                        if lastjump:
+                            qcjumps = []
+                            start_true = pj_start_true(lastjump)
+                            curjump = addr
+                            dto = addr
+                            while curjump < start_true:
+                                curjump = proc_chained(self, curjump)
                                 x = curjump.jump()[-1]
-                                if x.opcode == JUMP_FORWARD:
+                                if curjump.addr < curjump.arg <= next_stmt.addr and\
+                                        x.opcode == JUMP_FORWARD and\
+                                        x[-1].opcode != POP_TOP:
                                     curaddr = curjump[1]
                                     while curaddr < x:
                                         if curaddr.opcode in pop_jump_if_opcodes and\
@@ -776,18 +683,116 @@ class Code:
                                             break
                                         curaddr = curaddr[1]
                                     if curaddr:
-                                        if x.addr in self.linemap:
-                                            self.statement_jumps.append(curjump)# if a: pass else:
+                                        if x.jump() > next_stmt or x.addr in self.linemap:#  if a: pass else:
+                                            self.statement_jumps.append(curjump)
                                         else:
                                             self.ternaryop_jumps.append(curjump)
-                            elif curjump.arg > next_stmt.addr and self.name == '<lambda>':
-                                self.ternaryop_jumps.append(curjump)# return (a if b else c)
-                            curjump = curjump[1]
-                            while curjump < next_stmt:
-                                if curjump.opcode in pop_jump_if_opcodes:
-                                    break
+                                            if x > dto:
+                                                dto = x.jump()[-2]#-2 in case if (a if b else True):
+                                elif curjump.arg == start_true.addr:# if a or
+                                    dto = lastjump
+                                elif curjump.addr < curjump.arg < start_true.addr:
+                                    if x > dto:
+                                        dto = x
+                                else:
+                                    if dto <= curjump:
+                                        if pj_start_true(curjump).addr in self.linemap:
+                                            if curjump not in self.statement_jumps:
+                                                curaddr = curjump[1]
+                                                if curjump.is_continue_jump:
+                                                    #detect if a: if b or c:
+                                                    if curjump != lastjump and curjump.arg != lastjump.arg:# only or
+                                                        if start_true.opcode == JUMP_ABSOLUTE and start_true.arg == curjump.arg:
+                                                            while curaddr < lastjump:
+                                                                if curaddr.opcode in pop_jump_if_opcodes and\
+                                                                        curaddr.arg > lastjump.arg:
+                                                                    curaddr = None
+                                                                    break
+                                                                curaddr = curaddr[1]
+                                                            if curaddr is None:
+                                                                curaddr = curjump#flag statement jump
+                                                            else:
+                                                                dto = lastjump
+                                                                curaddr = None#flag no statement
+                                                                qcjumps.append(curjump)
+                                                elif x.opcode == JUMP_FORWARD or\
+                                                        (x.opcode == JUMP_ABSOLUTE and x.arg > curjump.arg):
+                                                    while curaddr <= lastjump:# < x:
+                                                        if curaddr.opcode in pop_jump_if_opcodes and\
+                                                                curaddr.arg == curjump.arg:# if a and b:...else:
+                                                            curaddr = None
+                                                            break
+                                                        curaddr = curaddr[1]
+                                                if curaddr:
+                                                    self.statement_jumps.append(curjump)# just if a:
+                                        elif curjump == lastjump:
+                                            if next_stmt.opcode == RETURN_VALUE:
+                                                self.ternaryop_jumps.append(curjump)# return (a if b else c)
+                                        if curjump in self.statement_jumps and len(qcjumps):
+                                            if curjump == lastjump:
+                                                if len(self.statement_jumps) < 2 or not self.statement_jumps[-2].is_continue_jump:
+                                                    enda = Address(self, self.loops[-1][2])
+                                                    if len(self.statement_jumps) > 1 and self.statement_jumps[-2] > anda:
+                                                        enda = self.statement_jumps[-2].jump()
+                                                    c = 0
+                                                    if x.opcode != JUMP_ABSOLUTE or x.arg < enda.addr:
+                                                        if x.opcode == JUMP_ABSOLUTE and x != next_stmt:
+                                                            if x.arg < x.addr:
+                                                                starta = x[1]
+                                                                c = 2
+                                                            else:
+                                                                starta = x.jump()
+                                                                c = 1
+                                                        elif x.opcode == JUMP_FORWARD:
+                                                            starta = x.jump()
+                                                            c = 1
+                                                        elif x.opcode == RETURN_VALUE:
+                                                            starta = x[1]
+                                                            c = 2
+                                                        else:
+                                                            starta = x[1]
+                                                            c = 1
+                                                    c = count_returns(starta, enda) - c
+                                                    while c > 0 and len(qcjumps):
+                                                        x = qcjumps[-1]
+                                                        self.statement_jumps.append(x)
+                                                        qcjumps.remove(x)
+                                                        c = c - 1
+                                            self.qcjumps = self.qcjumps + qcjumps
+                                            qcjumps = []
                                 curjump = curjump[1]
-                        i = next_stmt.index - 1
+                                while curjump < start_true:
+                                    if curjump.opcode in pop_jump_if_opcodes:
+                                        break
+                                    curjump = curjump[1]
+                            i = start_true.index - 1
+                        else:
+                            curjump = addr
+                            while curjump < next_stmt:
+                                curjump = proc_chained(self, curjump)
+                                if curjump.addr < curjump.arg <= next_stmt.addr:
+                                    x = curjump.jump()[-1]
+                                    if x.opcode == JUMP_FORWARD:
+                                        curaddr = curjump[1]
+                                        while curaddr < x:
+                                            if curaddr.opcode in pop_jump_if_opcodes and\
+                                                    curaddr.arg == curjump.arg:# aa or (a if b else True)
+                                                curaddr = None
+                                                break
+                                            curaddr = curaddr[1]
+                                        if curaddr:
+                                            if x.addr in self.linemap:
+                                                self.statement_jumps.append(curjump)# if a: pass else:
+                                            else:
+                                                self.ternaryop_jumps.append(curjump)
+                                elif curjump.arg > next_stmt.addr and self.name == '<lambda>':
+                                    self.ternaryop_jumps.append(curjump)# return (a if b else c)
+                                curjump = curjump[1]
+                                while curjump < next_stmt:
+                                    if curjump.opcode in pop_jump_if_opcodes:
+                                        break
+                                    curjump = curjump[1]
+                            i = next_stmt.index - 1
             i = i + 1
 
     def find_else(self):
@@ -986,10 +991,12 @@ class Address:
         if self.opcode in stmt_opcodes or\
                 self.opcode in (JUMP_ABSOLUTE, JUMP_FORWARD) and self.addr in self.code.linemap:
             return True
-        if self.opcode == POP_TOP:
+        elif self.opcode == POP_TOP:
             if self[-1] and self[-1].opcode in (JUMP_ABSOLUTE, JUMP_FORWARD, ROT_TWO):
                 return False
             return True
+        elif self.opcode in pop_jump_if_opcodes:
+            return self.jump() == self[1]
         return False
     
     def change_instr(self, opcode, arg=None):
