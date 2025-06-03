@@ -2566,31 +2566,36 @@ class SuiteDecompiler:
         
         self.suite.add_statement(stmt)
 
-        has_normal_else_clause = j_except.opcode == JUMP_FORWARD and j_except[2] != j_except.jump()
-        has_end_of_loop_else_clause = j_except.opcode == JUMP_ABSOLUTE and j_except.is_continue_jump and j_except[1].opcode == END_FINALLY
-        has_return_else_clause = j_except.opcode == RETURN_VALUE
-        if has_normal_else_clause or has_end_of_loop_else_clause or has_return_else_clause:
-            assert j_except[1].opcode == END_FINALLY
-            start_else = j_except[2]
-            if has_return_else_clause and start_else.opcode == JUMP_ABSOLUTE and start_else[1].opcode == POP_BLOCK:
-                start_else = start_else[-1]
-            end_else: Address = None
-            if has_normal_else_clause:
-                end_else = j_except.jump()
-            elif has_end_of_loop_else_clause:
-                end_try = end_try[-1]
-                if end_try.is_continue_jump:
+        x = j_except[1]
+        if x and x.opcode == END_FINALLY:
+            has_normal_else_clause = j_except.opcode == JUMP_FORWARD and j_except[2] != j_except.jump()
+            has_end_of_loop_else_clause = j_except.opcode == JUMP_ABSOLUTE and j_except.is_continue_jump
+            has_return_else_clause = j_except.opcode == RETURN_VALUE
+            x = self.end_block[1]
+            has_nested_if_else_clause = j_except.opcode == JUMP_ABSOLUTE and x and j_except.jump() > x and x.opcode == JUMP_FORWARD
+            if has_normal_else_clause or has_end_of_loop_else_clause or has_return_else_clause or has_nested_if_else_clause:
+                start_else = j_except[2]
+                if has_return_else_clause and start_else.opcode == JUMP_ABSOLUTE and start_else[1].opcode == POP_BLOCK:
+                    start_else = start_else[-1]
+                end_else: Address = None
+                if has_normal_else_clause:
+                    end_else = j_except.jump()
+                elif has_end_of_loop_else_clause:
+                    end_try = end_try[-1]
+                    if end_try.is_continue_jump:
+                        return end_addr
+                    end_else = self.end_addr
+                elif has_return_else_clause:
                     return end_addr
-                end_else = self.end_addr
-            elif has_return_else_clause:
-                return end_addr
-                #end_else = j_except[1].seek_forward(RETURN_VALUE)[1]
-            #if has_return_else_clause and not end_else:
-                #return end_addr
-            d_else = SuiteDecompiler(start_else, end_else)
-            d_else.run()
-            end_addr = end_else
-            stmt.else_suite = d_else.suite
+                    #end_else = j_except[1].seek_forward(RETURN_VALUE)[1]
+                elif has_nested_if_else_clause:
+                    end_else = self.end_block[1]
+                #if has_return_else_clause and not end_else:
+                    #return end_addr
+                d_else = SuiteDecompiler(start_else, end_else)
+                d_else.run()
+                end_addr = end_else
+                stmt.else_suite = d_else.suite
         return end_addr
 
     def SETUP_WITH(self, addr, delta):
