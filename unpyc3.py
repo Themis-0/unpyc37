@@ -161,6 +161,9 @@ for_jump_opcodes = (
 unpack_stmt_opcodes = {STORE_NAME, STORE_FAST, STORE_SUBSCR, STORE_GLOBAL, STORE_DEREF, STORE_ATTR}
 unpack_terminators = stmt_opcodes - unpack_stmt_opcodes
 
+EXPR_OPC = (LOAD_ATTR, LOAD_GLOBAL, LOAD_NAME, LOAD_CONST, LOAD_FAST, LOAD_DEREF, BINARY_SUBSCR, BUILD_LIST, CALL_FUNCTION, BINARY_SUBTRACT, BINARY_ADD, BINARY_MULTIPLY, BINARY_TRUE_DIVIDE, BINARY_MODULO, BINARY_OR, BINARY_XOR, BINARY_AND, BINARY_FLOOR_DIVIDE, BINARY_MATRIX_MULTIPLY, BINARY_LSHIFT, BINARY_RSHIFT, COMPARE_OP, UNARY_NEGATIVE, BINARY_POWER, UNARY_INVERT, UNARY_POSITIVE, UNARY_NOT, CALL_METHOD, BUILD_TUPLE, BUILD_SET, BUILD_MAP, BUILD_SLICE)
+INPLACE_OPC = (INPLACE_MATRIX_MULTIPLY, INPLACE_FLOOR_DIVIDE, INPLACE_TRUE_DIVIDE, INPLACE_ADD, INPLACE_SUBTRACT, INPLACE_MULTIPLY, INPLACE_MODULO, INPLACE_POWER, INPLACE_LSHIFT, INPLACE_RSHIFT, INPLACE_AND, INPLACE_XOR, INPLACE_OR)
+
 def read_code(stream):
     # This helper is needed in order for the PEP 302 emulation to 
     # correctly handle compiled files
@@ -2681,7 +2684,6 @@ class SuiteDecompiler:
 
     def ROT_TWO(self, addr: Address):
         # special case: x, y = z, t
-        EXPR_OPC = (LOAD_ATTR, LOAD_GLOBAL, LOAD_NAME, LOAD_CONST, LOAD_FAST, LOAD_DEREF, BINARY_SUBSCR, BUILD_LIST, CALL_FUNCTION, BINARY_SUBTRACT, BINARY_ADD, BINARY_MULTIPLY, BINARY_TRUE_DIVIDE, BINARY_MODULO, BINARY_OR, BINARY_XOR, BINARY_AND, BINARY_FLOOR_DIVIDE, BINARY_MATRIX_MULTIPLY, BINARY_LSHIFT, BINARY_RSHIFT, COMPARE_OP, UNARY_NEGATIVE, BINARY_POWER, UNARY_INVERT, UNARY_POSITIVE, UNARY_NOT)
         if addr[-1].opcode in EXPR_OPC:
             next_stmt = addr.seek_forward((*unpack_terminators, *pop_jump_if_opcodes, *else_jump_opcodes))
             if next_stmt is None or next_stmt > self.end_block:
@@ -2701,21 +2703,22 @@ class SuiteDecompiler:
     def ROT_THREE(self, addr: Address):
         if not (addr[-1].opcode == DUP_TOP and addr[1].opcode == COMPARE_OP and\
                 addr[2].opcode in (JUMP_IF_FALSE_OR_POP, POP_JUMP_IF_FALSE, POP_JUMP_IF_TRUE)):
-            # special case: x, y, z = a, b, c
-            next_stmt = addr.seek_forward((*unpack_terminators, *pop_jump_if_opcodes, *else_jump_opcodes))
-            if next_stmt is None or next_stmt > self.end_block:
-                next_stmt = self.end_addr
-            rot_two = addr[1]
-            first = rot_two and rot_two.seek_forward(unpack_stmt_opcodes, next_stmt)
-            second = first and first.seek_forward(unpack_stmt_opcodes, next_stmt)
-            third = second and second.seek_forward(unpack_stmt_opcodes, next_stmt)
-            if first and second and third:
-                val = PyTuple(self.stack.pop(3))
-                unpack = Unpack(val, 3)
-                self.stack.push(unpack)
-                self.stack.push(unpack)
-                self.stack.push(unpack)
-                return addr[2]
+            if addr[-1].opcode not in INPLACE_OPC: #a[i] += b
+                # special case: x, y, z = a, b, c
+                next_stmt = addr.seek_forward((*unpack_terminators, *pop_jump_if_opcodes, *else_jump_opcodes))
+                if next_stmt is None or next_stmt > self.end_block:
+                    next_stmt = self.end_addr
+                rot_two = addr[1]
+                first = rot_two and rot_two.seek_forward(unpack_stmt_opcodes, next_stmt)
+                second = first and first.seek_forward(unpack_stmt_opcodes, next_stmt)
+                third = second and second.seek_forward(unpack_stmt_opcodes, next_stmt)
+                if first and second and third:
+                    val = PyTuple(self.stack.pop(3))
+                    unpack = Unpack(val, 3)
+                    self.stack.push(unpack)
+                    self.stack.push(unpack)
+                    self.stack.push(unpack)
+                    return addr[2]
         
         tos2, tos1, tos = self.stack.pop(3)
         self.stack.push(tos, tos2, tos1)
